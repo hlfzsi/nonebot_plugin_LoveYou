@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>漂流瓶~不能进来喵~!~</title>
+    <style>
+        body {
+            font-family: 'Microsoft YaHei', 'Microsoft JhengHei', 'Arial', sans-serif;
+            margin: 0;
+            padding: 0;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            background: linear-gradient(to right, #ffcccb, #ffebcd);
+        }
+
+        .container {
+            background-color: #fff;
+            padding: 2em;
+            border-radius: 15px;
+            box-shadow: 0 0 10px rgba(0, 0, 0, 0.1);
+            width: 30%;
+            min-width: 300px;
+            text-align: center;
+            box-sizing: border-box;
+            border: 2px solid #ff6347;
+            position: relative;
+            /* 添加相对定位 */
+        }
+
+        h1 {
+            color: #333;
+            margin-bottom: 1em;
+            font-size: 2em;
+        }
+
+        .hidden {
+            display: none;
+        }
+
+        button {
+            background-color: #ff6347;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            margin-top: 10px;
+            border-radius: 10px;
+            cursor: pointer;
+            transition: background-color 0.3s ease;
+            position: relative;
+            overflow: hidden;
+        }
+
+        button::after {
+            content: "";
+            position: absolute;
+            left: -20px;
+            top: 0;
+            width: 20px;
+            height: 100%;
+            background: rgba(255, 255, 255, 0.2);
+            opacity: 0.5;
+            transform: skewX(-45deg);
+            transition: all 0.5s cubic-bezier(0.5, 0, 0.5, 1);
+        }
+
+        button:hover::after {
+            left: 100%;
+        }
+
+        button:hover {
+            background-color: #ff4500;
+        }
+
+        input {
+            padding: 10px;
+            border: 1px solid #ccc;
+            border-radius: 10px;
+            width: calc(100% - 22px);
+            margin-bottom: 10px;
+            font-size: 1em;
+        }
+
+        #review p {
+            margin: 5px 0;
+            font-size: 1em;
+        }
+
+        #review img {
+            max-width: 100%;
+            height: auto;
+            border-radius: 10px;
+            cursor: pointer;
+        }
+
+        .modal {
+            display: none;
+            position: fixed;
+            z-index: 1;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            overflow: auto;
+            background-color: rgba(0, 0, 0, 0.5);
+        }
+
+        .modal-content {
+            margin: 15% auto;
+            display: block;
+            width: 80%;
+            max-width: 700px;
+        }
+
+        .close {
+            position: absolute;
+            top: 15px;
+            right: 35px;
+            color: #f1f1f1;
+            font-size: 40px;
+            font-weight: bold;
+            transition: 0.3s;
+        }
+
+        .close:hover,
+        .close:focus {
+            color: #bbb;
+            text-decoration: none;
+            cursor: pointer;
+        }
+
+        .icon {
+            font-size: 1.5em;
+            color: #ff6347;
+            margin-right: 0.5em;
+        }
+
+        .actions {
+            display: flex;
+            justify-content: space-around;
+            margin-top: 1em;
+        }
+
+        .actions button {
+            flex: 1;
+            margin: 0 0.5em;
+        }
+
+        .prompt {
+            font-size: 0.8em;
+            color: #666;
+        }
+
+        /* 加载小球动画 */
+        @keyframes pulsate {
+
+            0%,
+            100% {
+                transform: scale(1);
+            }
+
+            50% {
+                transform: scale(0.5);
+            }
+        }
+
+        .loading-container {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            /* 居中对齐 */
+            position: absolute;
+            /* 绝对定位 */
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(255, 255, 255, 0.8);
+            /* 背景颜色和透明度 */
+            z-index: 9999;
+            /* 确保加载框始终位于最顶层 */
+        }
+
+        .loading-ball {
+            width: 24px;
+            height: 24px;
+            border-radius: 50%;
+            background-color: #ff6347;
+            margin-left: 10px;
+            animation: pulsate 1s ease-in-out infinite;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="container">
+        <header>
+            <h1><i class="fas fa-smile"></i> Review System</h1>
+        </header>
+        <main>
+            <div id="auth">
+                <input type="password" id="password" placeholder="请输入密码">
+                <button onclick="authenticate()">校验</button>
+            </div>
+            <div id="review" class="hidden">
+                <p>ID: <span id="id"></span></p>
+                <p>用户ID: <span id="userid"></span></p>
+                <p>群聊ID: <span id="groupid"></span></p>
+                <p>消息: <span id="message"></span></p>
+                <img id="image" src="" alt="图片" usemap="#imageMap" />
+                <p>投放时间: <span id="timestamp"></span></p>
+                <p>点赞数: <span id="likes"></span></p>
+                <p>点踩数: <span id="dislikes"></span></p>
+                <p>是否屏蔽: <span id="blocked"></span></p>
+                <p>抽取次数: <span id="drawcount"></span></p>
+                <p>最后抽取时间: <span id="lastdrawn"></span></p>
+                <div class="actions">
+                    <button onclick="approve()">通过</button>
+                    <button onclick="reject()">拒绝</button>
+                </div>
+            </div>
+        </main>
+    </div>
+    <div id="myModal" class="modal">
+        <span class="close">&times;</span>
+        <img class="modal-content" id="img01">
+    </div>
+    <div id="loading" class="hidden">
+        <div class="loading-container">
+            <p>加载中，请稍候...</p>
+            <div class="loading-ball"></div>
+        </div>
+    </div>
+    <script>
+    async function authenticate() {
+        showLoading();
+        const password = document.getElementById('password').value;
+        const response = await fetch('/authenticate', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({ password })
+        });
+        hideLoading();
+        if (response.ok) {
+            document.getElementById('auth').classList.add('hidden');
+            document.getElementById('review').classList.remove('hidden');
+            fetchReview();
+        } else {
+            alert('认证失败，请检查您的凭证。');
+        }
+    }
+
+    async function fetchReview() {
+        showLoading();
+        const response = await fetch('/review');
+        hideLoading();
+        if (response.status === 204) {
+            document.getElementById('review').innerHTML = '<p>没有更多的记录可供审核。</p>';
+        } else {
+            const data = await response.json();
+            document.getElementById('id').innerText = data.id;
+            document.getElementById('userid').innerText = data.userid;
+            document.getElementById('groupid').innerText = data.groupid;
+            document.getElementById('message').innerText = data.message;
+            const imgElement = document.getElementById('image');
+            imgElement.src = data.image_base64 ? `data:image/jpeg;base64,${data.image_base64}` : '';
+            imgElement.onerror = function () {
+                this.style.display = 'none';
+            };
+            document.getElementById('timestamp').innerText = data.timestamp;
+            document.getElementById('likes').innerText = data.likes;
+            document.getElementById('dislikes').innerText = data.dislikes;
+            document.getElementById('blocked').innerText = data.blocked ? '是' : '否';
+            document.getElementById('drawcount').innerText = data.draw_count;
+                document.getElementById('lastdrawn').innerText = data.last_drawn || '无抽取记录';
+                imgElement.onclick = function () {
+                    showImage(this.src);
+                };
+            }
+        }
+
+        function showImage(src) {
+            const modal = document.getElementById("myModal");
+            const img = document.getElementById("img01");
+            const span = document.getElementsByClassName("close")[0];
+            img.src = src;
+            modal.style.display = "block";
+            span.onclick = function () {
+                modal.style.display = "none";
+            }
+        }
+
+        function showLoading() {
+            document.getElementById('loading').classList.remove('hidden');
+        }
+
+        function hideLoading() {
+            document.getElementById('loading').classList.add('hidden');
+        }
+
+    async function approve() {
+        showLoading();
+        const response = await fetch('/review', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({ action: 'approve', id: document.getElementById('id').innerText })
+        });
+        hideLoading();
+        if (response.ok) {
+            alert('已通过！');
+            fetchReview();
+        } else {
+            alert(`通过失败。状态码: ${response.status} ${response.statusText}`);
+        }
+    }
+
+    async function reject() {
+        showLoading();
+        const response = await fetch('/review', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({ action: 'reject', id: document.getElementById('id').innerText })
+        });
+        hideLoading();
+        if (response.ok) {
+            alert('已拒绝！');
+            fetchReview();
+        } else {
+            alert(`拒绝失败。状态码: ${response.status} ${response.statusText}`);
+        }
+    }
+    </script>
+</body>
+
+</html>

@@ -1,0 +1,13 @@
+{
+    "black_list": {
+        "groupid": [],
+        "userid": []
+    },
+    "white_list": {
+        "groupid": [
+            "101",
+            "131"
+        ],
+        "userid": []
+    }
+}

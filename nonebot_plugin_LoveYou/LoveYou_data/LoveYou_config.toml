@@ -1,0 +1,33 @@
+[random_CG]
+baseline = 100
+rate = 0.02
+
+[others]
+bot_name = ""
+master = '102'                          #填写你的编号，控制权限使用
+search_love_reply = "[qq]的好感度是[love]喵~" #这一项没有用，但请保留
+tank_enable = true
+
+[csv]
+common_love = "-1,1" #全局词库默认好感变化区间
+
+[ai]
+enable = true
+model = "qingyunke" #可填写qingyunke或百度模型(需要具体模型名称)。若使用百度，请自行获取API_Key和Secret_Key，并填写role
+role = ""           #AI人设
+API_Key = ""
+Secret_Key = ""
+memory = true       #AI对话是否启用记忆功能
+
+[lv]
+enable = true                                          #请保持为True
+lv1 = "-999,-50"
+lv1_reply = "[bot]讨厌[qq]\n[sender]的好感度是[love]"
+lv2 = "-50,50"
+lv2_reply = "[qq]对[bot]而言只是陌生人\n[sender]的好感度是[love]"
+lv3 = "50,200"
+lv3_reply = "其实，[qq]也不赖呢\n[sender]的好感度是[love]"
+lv4 = "200,1000"
+lv4_reply = "也许，[bot]会考虑多陪[qq]聊天\n[sender]的好感度是[love]"
+lv5 = "1000,9999"
+lv5_reply = "[bot]爱[qq]！\n[sender]的好感度是[love]"
