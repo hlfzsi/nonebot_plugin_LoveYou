@@ -4,6 +4,8 @@ import json
 import urllib
 import requests
 import os
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import aiofiles
 from nonebot import logger
 from datetime import datetime, timedelta
@@ -27,13 +29,18 @@ from collections import defaultdict
 
 MAX_AGE = timedelta(minutes=60)  # 消息的有效时间为60分钟
 previous_msgs = defaultdict(datetime)
+qianfan.disable_log()
+executor = ThreadPoolExecutor(max_workers=4)
 
 
 async def qingyunke(msg: str):
     url = 'http://api.qingyunke.com/api.php?key=free&appid=0&msg={}'.format(
         urllib.parse.quote(msg))
-    html = requests.get(url)
-    return html.json()["content"]
+
+    loop = asyncio.get_running_loop()
+    response = await loop.run_in_executor(executor, requests.get, url)
+
+    return response.json()["content"]
 
 
 async def baidu_ai(msg: str, qq: str, intlove, name: str, lv='Unknown') -> str:
@@ -44,39 +51,51 @@ async def baidu_ai(msg: str, qq: str, intlove, name: str, lv='Unknown') -> str:
     name = await replace_qq(qq)
     time = datetime.now()
     time = time.strftime("%Y-%m-%d.%H:%M")
-    loacl_role = role
-    loacl_role = loacl_role.replace(
+    local_role = role
+    local_role = local_role.replace(
         '[intlove]', intlove).replace('[sender]', name).replace('[time]', time)
     if lv != 'Unknown':
-        loacl_role = loacl_role.replace('[lv]', str(lv))
-    if memory == True:
+        local_role = local_role.replace('[lv]', str(lv))
+    if memory:
         send_msg = await chat_memory(qq, msg, '')
-        while len(send_msg) + len(loacl_role) >= 20000:
+        while len(send_msg) + len(local_role) >= 20000:
             await reduce_memory(qq)
             send_msg = await chat_memory(qq, msg, '')
-        resp = qianfan.ChatCompletion().do(model=model,
-                                           messages=send_msg, temperature=0.98, top_p=0.7, penalty_score=1, system=loacl_role)
+        loop = asyncio.get_running_loop()
+        resp = await loop.run_in_executor(executor, lambda: qianfan.ChatCompletion().do(
+            model=model,
+            messages=send_msg,
+            temperature=0.95,
+            top_p=0.7,
+            penalty_score=1,
+            system=local_role,
+            show_total_latency=True
+        ))
         try:
-            if msg != f'你有什么想对我说的话':
+            if msg != '你有什么想对我说的话':
                 await chat_memory(qq, msg, resp['result'])
-            if resp['need_clear_history'] == True or resp['need_clear_history'] == 'True':
+            if resp['need_clear_history']:
                 await clear_memory(qq)
                 logger.debug('清理用户记忆')
         except:
             pass
 
-    elif memory == False:
-        resp = qianfan.ChatCompletion().do(model=model,
-                                           messages=[{"role": "user", "content": msg}], temperature=0.98, top_p=0.7, penalty_score=1, system=loacl_role)
-
-    try:
-        return resp['result']
-    except:
-        return '模型填写错误喵~猫闹过载ing'
+    else:
+        loop = asyncio.get_running_loop()
+        resp = await loop.run_in_executor(executor, lambda: qianfan.ChatCompletion().do(
+            model=model,
+            messages=send_msg,
+            temperature=0.95,
+            top_p=0.7,
+            penalty_score=1,
+            system=local_role,
+            show_total_latency=True
+        ))
+    return resp['result']
 
 
 async def clear_memory(qq: str):
-    file_path = os.path.join(DATA_DIR, f'/memory/{qq}.json')
+    file_path = os.path.join(DATA_DIR, "memory", f'{qq}.json')
     try:
         os.remove(file_path)
     except FileNotFoundError:
@@ -84,7 +103,7 @@ async def clear_memory(qq: str):
 
 
 async def reduce_memory(qq: str):
-    file_path = os.path.join(DATA_DIR, f'/memory/{qq}.json')
+    file_path = os.path.join(DATA_DIR, "memory", f'{qq}.json')
     try:
         async with aiofiles.open(file_path, 'r', encoding='utf-8') as file:
             data = json.loads(await file.read())
@@ -110,7 +129,7 @@ async def chat_memory(qq: str, question: str, answer: str):
         answer (str): 回复消息
     """
     # 构造文件路径
-    file_path = os.path.join(DATA_DIR, f'/memory/{qq}.json')
+    file_path = os.path.join(DATA_DIR, "memory", f'{qq}.json')
 
     # 确保目录存在
     os.makedirs(os.path.dirname(file_path), exist_ok=True)

@@ -1,18 +1,25 @@
+from PIL import Image, ImageDraw, ImageFont
 import re
 import os
+import cv2
+import numpy as np
 import random
+import io
+import asyncio
+import time
 from . import DATA_DIR
 import base64
-import io
 import httpx
-from PIL import ImageDraw, ImageFont, ImageFilter, Image
+from typing import List, Dict, Tuple
+from functools import lru_cache
+from PIL import ImageDraw, ImageFont, Image
 from nonebot import logger
 from .love_manager import get_both_love, get_range, replace_qq
 from .config import result
 from .AI_chat import qingyunke, baidu_ai
 (
     bot_name, baseline, rate, master,
-    search_love_reply, botreact, model, role,
+    search_love_reply, botreact, model_chat, role,
     API_Key, Secret_Key, tank_enable, Ca, Cb,
     lv_enable, La, Lb, Lc, Ld,
     Le, Lf, Lg, Lh, Li, Lj,
@@ -20,7 +27,39 @@ from .AI_chat import qingyunke, baidu_ai
 ) = result
 
 
+@lru_cache(maxsize=1)
+def load_model_image(path):
+    if not os.path.exists(path):
+        logger.error("模型图片不存在")
+        return None
+    return cv2.imread(path, cv2.IMREAD_UNCHANGED)
+
+
 async def pic_reply(qq, pre_pic, name, avatarurl):
+    start_time = time.time()
+    int_love, str_love = await get_both_love(qq)
+    lv = get_range(int_love)
+    if lv is None and int_love > 0:
+        lv = 5
+        lv_r = 'Nan'
+    elif lv is None and int_love <= 0:
+        lv = 1
+        lv_r = 'Nan'
+    else:
+        lv_r = str(lv)
+    if model_chat != 'qingyunke':
+        comment = asyncio.create_task(
+            baidu_ai(f'你有什么想对我说的话', qq, int_love, name, str(lv)))
+    else:
+        comment = asyncio.create_task(qingyunke(f'我在{bot_name}心中的印象是什么'))
+
+    def glass_effect(img, regions, blur_radius=3):
+        for x, y, w, h in regions:
+            region = img[y:y+h, x:x+w]
+            blurred_region = cv2.GaussianBlur(
+                region, (blur_radius*2+1, blur_radius*2+1), 0)
+            img[y:y+h, x:x+w] = blurred_region
+        return img
 
     def truncate_text(text: str):
         # 如果文本长度小于等于49，直接返回
@@ -28,7 +67,7 @@ async def pic_reply(qq, pre_pic, name, avatarurl):
             return text
 
         # 定义中英文标点符号
-        punctuation = r'[。！？”’》〉」』】〕、·…—～﹏`\'\"!@#$%^&*()-_=+]}|;:.>/?]'
+        punctuation = r'[。！？”’》〉」』】〕、·…—～﹏`\'\"!@#$%^&*()-_=+]}|;:.>/?]\(（'
 
         # 在第29个字符后查找第一个标点符号，直到第90个字符
         match = re.search(punctuation, text[49:90])
@@ -101,120 +140,187 @@ async def pic_reply(qq, pre_pic, name, avatarurl):
         # 返回完整图片路径
         return chosen_image
 
-    def add_centered_text(image: Image.Image, text: str, position, font_size: int, color, font_path=os.path.join(DATA_DIR, 'arial.ttf')):
-        # 加载字体
-        font = ImageFont.truetype(font_path, font_size)
-
-        # 创建一个可以在给定图像上绘图的对象
-        draw = ImageDraw.Draw(image)
-
-        # 分割文本为多行
-        lines = text.split('\n')
-
-        # 计算每一行的宽度和高度
-        line_widths = [abs(font.getbbox(line)[2] - font.getbbox(line)[0])
-                       for line in lines]
-        line_heights = [
-            abs(font.getbbox(line)[3] - font.getbbox(line)[1]) for line in lines]
-
-        # 确定最长行的宽度，用于计算居中位置
-        max_width = max(line_widths)
-
-        # 计算所有行的总高度
-        total_text_height = sum(line_heights)
-
-        # 确定垂直居中的起始y坐标
-        y = position[1] - total_text_height // 2
-
-        # 计算水平居中的x坐标
-        x = position[0] - max_width // 2
-
-        # 遍历所有行并添加到图像上
-        for i, line in enumerate(lines):
-            # 当前行的宽度
-            line_width = line_widths[i]
-
-            # 调整x坐标以确保文本在竖直轴上对称
-            adjusted_x = x + (max_width - line_width) // 2
-
-            # 在图像上添加文字
-            draw.text((adjusted_x, y), line, fill=color, font=font)
-
-            # 更新y坐标以绘制下一行
-            y += line_heights[i]
-
-        # 返回添加了文字的图像
-        return image
-
-    def glass_effect(img: Image.Image, regions):
-        """  
-        对图像中的指定区域应用毛玻璃效果（模糊处理），忽略透明度。  
-
-        :param image_path: 原始图像文件的路径（支持RGBA格式）。  
-        :param regions: 一个包含两个元组的列表，每个元组定义了一个要模糊的区域(x, y, width, height)。  
-        :return: 返回一个新图像，其中指定区域被应用了模糊效果。  
+    def add_texts(img: np.ndarray, texts: List[Dict[str, any]], font_path: str = os.path.join(DATA_DIR, 'arial.ttf')) -> str:
         """
-        for x, y, w, h in regions:
-            region = img.crop((x, y, x+w, y+h))
-            blurred_region = region.filter(ImageFilter.GaussianBlur(radius=3))
-            img.paste(blurred_region, (x, y))
-        return img
-    background = base64.b64decode(pre_pic)
-    background = io.BytesIO(background)
-    background = Image.open(background)
-    int_love, str_love = await get_both_love(qq)
-    background = background.resize((1024, 1024), Image.LANCZOS)
-    lv = get_range(int_love)
-    if lv == None and int_love > 0:
-        lv = 5
-        lv_r = 'Nan'
-    elif lv == None and int_love <= 0:
-        lv = 1
-        lv_r = 'Nan'
-    else:
-        lv_r = str(lv)
+        在图像上添加多个居中文本。
 
-    async with httpx.AsyncClient() as client:
-        response = await client.get(avatarurl)
-        image_data = response.content
-    avatar = Image.open(io.BytesIO(image_data))
-    cartoon = pick_pic(os.path.join(DATA_DIR, 'images', 'cartoon'), lv)
-    cartoon = Image.open(cartoon)
-    model = Image.open(os.path.join(DATA_DIR, 'images', 'essential', 'model.png'))
-    model = model.resize((1024, 1024), Image.LANCZOS)
-    avatar = avatar.resize((375, 375), Image.LANCZOS)
-    cartoon = cartoon.resize((375, 375), Image.LANCZOS)
-    cartoon = cartoon.convert('RGBA')
-    background = background.convert('RGBA')
-    model = model.convert('RGBA')
+        参数:
+        img (np.ndarray): 要添加文本的基础图像（OpenCV格式）。
+
+        texts (list of dict): 每个元素都是一个字典，包含以下键值对：
+                            - 'text': str, 要添加的文本内容。
+
+                            - 'position': tuple, 文本的中心位置 (x, y)。
+
+                            - 'font_size': int, 字体大小。
+
+                            - 'color': tuple, 文本颜色 (R, G, B, A) 或者 (R, G, B)。
+        font_path (str): 字体文件的路径，默认为'arial.ttf'。
+        """
+        # 将OpenCV图像转换为Pillow图像
+        if img.shape[2] == 4:  # 如果图像有Alpha通道
+            img_pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGRA2RGBA))
+        else:  # 如果图像没有Alpha通道
+            img_pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+        draw = ImageDraw.Draw(img_pil)
+
+        # 预加载所有需要的字体大小
+        fonts = {}
+        for text_info in texts:
+            font_size = text_info['font_size']
+            if font_size not in fonts:
+                fonts[font_size] = ImageFont.truetype(font_path, font_size)
+
+        for text_info in texts:
+            text = text_info['text']
+            position = text_info['position']
+            font_size = text_info['font_size']
+            color = text_info['color']
+
+            # 使用预加载的字体
+            font = fonts[font_size]
+
+            # 分割文本为多行
+            lines = text.split('\n')
+
+            # 计算每一行的宽度和高度
+            line_widths = [abs(font.getbbox(line)[2] -
+                               font.getbbox(line)[0]) for line in lines]
+            line_heights = [
+                abs(font.getbbox(line)[3] - font.getbbox(line)[1]) for line in lines]
+
+            # 确定最长行的宽度，用于计算居中位置
+            max_width = max(line_widths)
+
+            # 计算所有行的总高度
+            total_text_height = sum(line_heights)
+
+            # 确定垂直居中的起始y坐标
+            y = position[1] - total_text_height // 2
+
+            # 计算水平居中的x坐标
+            x = position[0] - max_width // 2
+
+            # 遍历所有行并添加到图像上
+            for i, line in enumerate(lines):
+                # 当前行的宽度
+                line_width = line_widths[i]
+
+                # 调整x坐标以确保文本在竖直轴上对称
+                adjusted_x = x + (max_width - line_width) // 2
+
+                # 在图像上添加文字
+                draw.text((adjusted_x, y), line, fill=color, font=font)
+
+                # 更新y坐标以绘制下一行
+                y += line_heights[i]
+
+        # 将Pillow图像直接转换为JPEG格式并编码为Base64字符串
+        buffered = io.BytesIO()
+        img_pil.save(buffered, format="JPEG", quality=30)
+        result = base64.b64encode(buffered.getvalue()).decode('utf-8')
+        return result
+
+    # 解码基础图像
+    background = base64.b64decode(pre_pic)
+    background = np.frombuffer(background, dtype=np.uint8)
+    background = cv2.imdecode(background, cv2.IMREAD_UNCHANGED)
+
+    background = cv2.resize(background, (1024, 1024),
+                            interpolation=cv2.INTER_LANCZOS4)
+
+    
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(avatarurl, timeout=1)
+            image_data = response.content
+        avatar = np.frombuffer(image_data, dtype=np.uint8)
+        avatar = cv2.imdecode(avatar, cv2.IMREAD_UNCHANGED)
+    except:
+        avatar = cv2.imread(os.path.join(
+            DATA_DIR, 'images', 'essential', 'avatar.jpg'), cv2.IMREAD_UNCHANGED)
+
+    avatar = np.frombuffer(image_data, dtype=np.uint8)
+    avatar = cv2.imdecode(avatar, cv2.IMREAD_UNCHANGED)
+
+    cartoon_path = pick_pic(os.path.join(DATA_DIR, 'images', 'cartoon'), lv)
+    if not os.path.exists(cartoon_path):
+        logger.error("无对应贴画可供使用")
+        return ""
+    cartoon = cv2.imread(cartoon_path, cv2.IMREAD_UNCHANGED)
+
+    model_path = os.path.join(DATA_DIR, 'images', 'essential', 'model.png')
+    model = load_model_image(model_path)
+    if model is None:
+        return ""
+
+    model = cv2.resize(model, (1024, 1024), interpolation=cv2.INTER_LANCZOS4)
+    avatar = cv2.resize(avatar, (375, 375), interpolation=cv2.INTER_LANCZOS4)
+    cartoon = cv2.resize(cartoon, (375, 375), interpolation=cv2.INTER_LANCZOS4)
+
+    # 应用毛玻璃效果
     background = glass_effect(
         background, [(45, 62, 522, 121), (45, 252, 520, 694)])
-    background.paste(avatar, (610, 545))
-    background.paste(cartoon, (610, 75), cartoon)
-    background.paste(model, (0, 0), model)
+
+    # 叠加图像
+    def merge_layers(bottom: np.ndarray, top: np.ndarray, pos: Tuple[int, int]) -> np.ndarray:
+        x, y = pos
+        h, w, c = top.shape
+
+        # 如果top图像是BGR格式，先转为BGRA
+        if c == 3:
+            top = cv2.cvtColor(top, cv2.COLOR_BGR2BGRA)
+
+        # 创建一个与bottom相同大小的临时图像
+        result = bottom.copy()
+
+        # 确保不会越界
+        if x < 0 or y < 0 or (x + w) > bottom.shape[1] or (y + h) > bottom.shape[0]:
+            raise ValueError(
+                "Position and size of top image exceed the boundaries of the bottom image.")
+
+        # 获取要覆盖的区域
+        roi = result[y:y+h, x:x+w]
+
+        # 提取top图像的alpha通道并归一化
+        top_alpha = top[:, :, 3] / 255.0
+
+        # 对每个颜色通道应用Alpha混合
+        for i in range(3):
+            # 使用Alpha通道混合颜色
+            roi[:, :, i] = (1.0 - top_alpha) * roi[:, :, i] + \
+                top_alpha * top[:, :, i]
+
+        return result
+
+    background = merge_layers(background, model, (0, 0))
+    background = merge_layers(background, avatar, (610, 545))
+    background = merge_layers(background, cartoon, (610, 75))
+
     qq = await replace_qq(qq)
     str_love = str_love.replace(' ', '\n', 1)
-    background = add_centered_text(
-        background, qq, (310, 113), 50, (220, 220, 220))
-    background = add_centered_text(
-        background, f'好感度:{str_love}', (300, 372), 45, (0, 0, 0))
-    background = add_centered_text(
-        background, f'好感等级Lv.{lv_r}', (300, 500), 45, (0, 0, 0))
-    try:
-        if model != 'qingyunke':
-            comment = await baidu_ai(f'你有什么想对我说的话', qq, int_love, name, str(lv))
-        else:
-            comment = await qingyunke(f'我在{bot_name}心中的印象是什么')
-    except:
-        comment = ''
-    if comment != '':
+
+    # 添加文本
+    texts = [
+        {'text': qq, 'position': (310, 113), 'font_size': 50,
+         'color': (220, 220, 220)},
+        {'text': f'好感度:{str_love}', 'position': (
+            300, 372), 'font_size': 45, 'color': (0, 0, 0)},
+        {'text': f'好感等级Lv.{lv_r}', 'position': (
+            300, 500), 'font_size': 45, 'color': (0, 0, 0)}
+    ]
+    comment = await comment
+
+    if comment:  # 如果有评论
         comment = truncate_text(comment)
         comment = auto_wrap_text(comment)
-        background = add_centered_text(
-            background, f'{comment}', (300, 700), 35, (0, 0, 205))
-    background = background.convert('RGB')
-    buffered = io.BytesIO()
-    background.save(buffered, format='JPEG', optimize=True)
-    result = buffered.getvalue()
-    result = base64.b64encode(result).decode('utf-8')
+        texts.append({'text': comment, 'position': (300, 700),
+                      'font_size': 35, 'color': (0, 0, 205)})
+
+    # 使用add_texts函数添加所有文本到背景图像上
+    result = add_texts(background, texts)
+    end_time = time.time()
+    duration = end_time - start_time
+    logger.debug(f'本次图片合成耗时 {duration} ')
+
     return result

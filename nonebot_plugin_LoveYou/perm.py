@@ -276,7 +276,7 @@ class BlackWhiteList:
             if id in self.black_list[id_type]:
                 return [f"{id} 已经作为 {id_type} 添加为黑名单"]
             else:
-                return [f"{id} 已经作为 {id_type} 添加为白名单"]
+                await self.remove_from_whitelist(id_type,id)
 
         if id_type == 'userid':
             if await self._check_in_table(id):

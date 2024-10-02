@@ -29,7 +29,7 @@ def generate_random_string(length=10):
     return random_string
 
 
-class DriftBottle:
+class DraftBottle:
     """
     漂流瓶类。
     """
@@ -411,7 +411,7 @@ class DriftBottle:
                 "UPDATE Bottles SET blocked=0 WHERE id=?", (bottle_id,))
             self.conn.commit()
 
-    def get_bottle_by_id(self, bottle_id: str) -> Optional[dict]:
+    def get_bottle_by_id_bo(self, bottle_id: str) -> Optional[dict]:
         """
         同步返回指定ID的漂流瓶信息。
         """
@@ -562,7 +562,7 @@ class DriftBottle:
 
         Args:
             input_text (str): 漂流瓶原始消息
-            qq (str): 触发漂流瓶的QQ
+            qq (str): 触发漂流瓶的qq
             groupid (str): 触发漂流瓶的群号
 
         Returns:
@@ -651,9 +651,10 @@ PASSWORD_EXPIRATION = 30  # 密码有效时间（秒）
 
 
 class ReviewApp:
-    def __init__(self, db_path=os.path.join(DATA_DIR, 'DriftBottles.db3')):
+    def __init__(self, db_path=os.path.join(DATA_DIR, 'DriftBottles.db3'), qq_db_path=os.path.join(DATA_DIR, 'qq.db3')):
         self.app = web.Application()
         self.db_path = db_path
+        self.qq_db_path = qq_db_path
         self.passwords = {}  # 存储密码及其生成时间
 
     async def get_db_connection(self):
@@ -681,6 +682,42 @@ class ReviewApp:
     async def handle_index(self, request):
         """ 返回主页文件 """
         return web.FileResponse(os.path.join(DATA_DIR, 'index.html'))
+
+    async def handle_qq_review(self, request):
+        """ 获取一个待审核的qq数据库记录 """
+        async with aiosqlite.connect(self.qq_db_path) as conn:
+            cursor = await conn.execute("SELECT * FROM qq_love WHERE state = 0 AND pic IS NOT NULL LIMIT 1")
+            columns = [col[0] for col in cursor.description]
+            row = await cursor.fetchone()
+            if row:
+                row = dict(zip(columns, row))
+            await cursor.close()
+
+        if row:
+            info = await self.get_qq_info(row)
+            return web.json_response(info)
+        else:
+            return web.Response(status=204)
+
+    async def get_qq_info(self, row):
+        """ 从qq数据库行中提取并格式化信息 """
+        current_time = datetime.now()
+        formatted_time = current_time.strftime('%Y-%m-%d %H:%M')
+
+        if row['pic'] is not None:
+            image_base64 = base64.b64encode(row['pic']).decode('utf-8')
+        else:
+            image_base64 = None
+
+        return {
+            'qq': row['QQ'],
+            'love': row['love'],
+            'alias': row['alias'],
+            'extra': row['extra'],
+            'image_base64': image_base64,
+            'real_id': row['real_id'],
+            'timestamp': formatted_time
+        }
 
     async def get_info(self, row):
         """ 从数据库行中提取并格式化信息 """
@@ -754,6 +791,29 @@ class ReviewApp:
 
         return result[0] if result and result[0] else None
 
+    async def handle_qq_review_action(self, request):
+        """ 执行qq数据库记录的审核动作 """
+        data = await request.json()
+        action = data.get('action')
+        qq = data.get('qq')
+
+        if action not in ('approve', 'reject'):
+            return web.Response(status=400, text='Invalid action')
+
+        async with aiosqlite.connect(self.qq_db_path) as conn:
+            try:
+                if action == 'approve':
+                    await conn.execute("UPDATE qq_love SET state = 200 WHERE qq = ?", (qq,))
+                else:
+                    await conn.execute("DELETE FROM qq_love WHERE qq = ?", (qq,))
+                await conn.commit()
+            except Exception as e:
+                logger.warning(f"Error updating database: {e}")
+                await conn.rollback()
+                return web.Response(status=500, text='Failed to update record')
+
+        return web.Response(text='Record updated')
+
     async def handle_review_action(self, request):
         """ 执行审核动作 """
         data = await request.json()
@@ -771,7 +831,7 @@ class ReviewApp:
                     await conn.execute("DELETE FROM Bottles WHERE id = ?", (id,))
                 await conn.commit()
             except Exception as e:
-                print(f"Error updating database: {e}")
+                logger.warning(f"Error updating database: {e}")
                 await conn.rollback()
                 return web.Response(status=500, text='Failed to update record')
 
@@ -799,15 +859,17 @@ class ReviewApp:
 app = None
 
 
-def init_app(db_path=os.path.join(DATA_DIR, 'DriftBottles.db3')):
+def init_app(db_path=os.path.join(DATA_DIR, 'DriftBottles.db3'), qq_db_path=os.path.join(DATA_DIR, 'qq.db3')):
     global app
     if app is None:
-        app = ReviewApp(db_path)
+        app = ReviewApp(db_path, qq_db_path)
     app.app.add_routes([
         web.get('/', app.handle_index),
         web.post('/authenticate', app.authenticate),
         web.get('/review', app.handle_review),
         web.post('/review', app.handle_review_action),
+        web.get('/qq_review', app.handle_qq_review),
+        web.post('/qq_review', app.handle_qq_review_action),
     ])
 
 

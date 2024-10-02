@@ -40,7 +40,8 @@ def start_db():
                         ('alias', 'TEXT', 'DEFAULT ""'),
                         ('extra', 'TEXT', 'DEFAULT ""'),
                         ('pic', 'BLOB'),
-                        ('real_id', 'TEXT', 'UNIQUE')
+                        ('real_id', 'TEXT', 'UNIQUE'),
+                        ('state', 'INTEGER', 'DEFAULT 0')
                     ],
                     'indexes': [
                         ('idx_real_id', 'real_id'),
@@ -349,7 +350,9 @@ async def write_pic(qq: str, pic_url: str) -> None:
             else:
                 # 如果找到了，更新pic字段
                 await cursor.execute(
-                    'UPDATE qq_love SET pic = ? WHERE QQ = ?', (jpeg_data, qq))
+                    'UPDATE qq_love SET pic = ?, state = 0 WHERE QQ = ?', (
+                        jpeg_data, qq)
+                )
 
             # 提交事务
             await conn.commit()
@@ -974,12 +977,12 @@ async def read_pic(qq: str, readonly: bool = False) -> str:
 
             # 尝试从qq_love表中读取pic
             await cursor.execute('''
-                SELECT pic FROM qq_love WHERE QQ = ?;
+                SELECT pic,state FROM qq_love WHERE QQ = ?;
             ''', (qq,))
             result = await cursor.fetchone()
 
-            if result is None:
-                if readonly:
+            if result is None or result[1] == 0:
+                if readonly or result[1] == 0:
                     return ''
                 else:
                     # 如果结果为空（即没有找到QQ），则插入新记录

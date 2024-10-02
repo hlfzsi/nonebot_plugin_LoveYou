@@ -6,6 +6,7 @@ import base64
 import hashlib
 import aiofiles
 import httpx
+import glob
 from httpx import AsyncClient
 from pathlib import Path
 from datetime import date, datetime
@@ -326,3 +327,12 @@ def image_to_base64(image_path):
     except Exception as e:
         logger.warning(f"发生错误: {e}")
         return None
+
+
+def find_images(path, filename):
+    image_formats = ['*.jpeg', '*.jpg', '*.png']
+    for format_ in image_formats:
+            files = glob.glob(os.path.join(path, filename + format_))
+            if files:
+                return os.path.basename(files[0])
+    return None

@@ -205,18 +205,35 @@
                 <input type="password" id="password" placeholder="请输入密码">
                 <button onclick="authenticate()">校验</button>
             </div>
+            <div id="reviewSelector" class="hidden">
+                <select id="reviewTarget" onchange="switchReviewTarget()">
+                    <option value="bottle">漂流瓶</option>
+                    <option value="qq">QQ数据库</option>
+                </select>
+            </div>
             <div id="review" class="hidden">
-                <p>ID: <span id="id"></span></p>
-                <p>用户ID: <span id="userid"></span></p>
-                <p>群聊ID: <span id="groupid"></span></p>
-                <p>消息: <span id="message"></span></p>
+                <!-- 漂流瓶审查信息 -->
+                <p class="bottleInfo">ID: <span id="id"></span></p>
+                <p class="bottleInfo">用户ID: <span id="userid"></span></p>
+                <p class="bottleInfo">群聊ID: <span id="groupid"></span></p>
+                <p class="bottleInfo">消息: <span id="message"></span></p>
                 <img id="image" src="" alt="图片" usemap="#imageMap" />
-                <p>投放时间: <span id="timestamp"></span></p>
-                <p>点赞数: <span id="likes"></span></p>
-                <p>点踩数: <span id="dislikes"></span></p>
-                <p>是否屏蔽: <span id="blocked"></span></p>
-                <p>抽取次数: <span id="drawcount"></span></p>
-                <p>最后抽取时间: <span id="lastdrawn"></span></p>
+                <p class="bottleInfo">投放时间: <span id="timestamp"></span></p>
+                <p class="bottleInfo">点赞数: <span id="likes"></span></p>
+                <p class="bottleInfo">点踩数: <span id="dislikes"></span></p>
+                <p class="bottleInfo">是否屏蔽: <span id="blocked"></span></p>
+                <p class="bottleInfo">抽取次数: <span id="drawcount"></span></p>
+                <p class="bottleInfo">最后抽取时间: <span id="lastdrawn"></span></p>
+
+                <!-- QQ数据库审查信息 -->
+                <p class="qqInfo hidden">userid: <span id="qq"></span></p>
+                <p class="qqInfo hidden">love值: <span id="love"></span></p>
+                <p class="qqInfo hidden">别名: <span id="alias"></span></p>
+                <p class="qqInfo hidden">好感后缀: <span id="extra"></span></p>
+                <p class="qqInfo hidden">真实ID: <span id="real_id"></span></p>
+                <img id="qqImage" class="hidden" src="" alt="QQ图片" usemap="#qqImageMap" />
+                <p class="qqInfo hidden">更新时间: <span id="qqTimestamp"></span></p>
+
                 <div class="actions">
                     <button onclick="approve()">通过</button>
                     <button onclick="reject()">拒绝</button>
@@ -235,34 +252,73 @@
         </div>
     </div>
     <script>
-    async function authenticate() {
-        showLoading();
-        const password = document.getElementById('password').value;
-        const response = await fetch('/authenticate', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({ password })
-        });
-        hideLoading();
-        if (response.ok) {
-            document.getElementById('auth').classList.add('hidden');
-            document.getElementById('review').classList.remove('hidden');
-            fetchReview();
-        } else {
-            alert('认证失败，请检查您的凭证。');
-        }
-    }
+        let currentReviewTarget = 'bottle'; // 默认审查目标是漂流瓶
 
-    async function fetchReview() {
-        showLoading();
-        const response = await fetch('/review');
-        hideLoading();
-        if (response.status === 204) {
-            document.getElementById('review').innerHTML = '<p>没有更多的记录可供审核。</p>';
-        } else {
-            const data = await response.json();
+        function switchReviewTarget() {
+            const reviewTarget = document.getElementById('reviewTarget').value;
+            if (reviewTarget === 'bottle') {
+                document.querySelectorAll('.bottleInfo').forEach(el => el.classList.remove('hidden'));
+                document.querySelectorAll('.qqInfo').forEach(el => el.classList.add('hidden'));
+                document.getElementById('image').classList.remove('hidden');
+                document.getElementById('qqImage').classList.add('hidden');
+            } else if (reviewTarget === 'qq') {
+                document.querySelectorAll('.bottleInfo').forEach(el => el.classList.add('hidden'));
+                document.querySelectorAll('.qqInfo').forEach(el => el.classList.remove('hidden'));
+                document.getElementById('image').classList.add('hidden');
+                document.getElementById('qqImage').classList.remove('hidden');
+            }
+            currentReviewTarget = reviewTarget;
+            fetchReview();
+        }
+
+        async function authenticate() {
+            showLoading();
+            const password = document.getElementById('password').value;
+            const response = await fetch('/authenticate', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ password })
+            });
+            hideLoading();
+            if (response.ok) {
+                document.getElementById('auth').classList.add('hidden');
+                document.getElementById('reviewSelector').classList.remove('hidden');
+                document.getElementById('review').classList.remove('hidden');
+                fetchReview();
+            } else {
+                alert('认证失败，请检查您的凭证。');
+            }
+        }
+
+        async function fetchReview() {
+            showLoading();
+            const url = currentReviewTarget === 'bottle' ? '/review' : '/qq_review';
+            const response = await fetch(url);
+            hideLoading();
+
+            if (response.status === 204) {
+                if (currentReviewTarget === 'bottle') {
+                    // 如果漂流瓶无记录，则自动切换到QQ数据库审阅
+                    document.getElementById('reviewTarget').value = 'qq';
+                    switchReviewTarget();
+                } else {
+                    // 如果QQ数据库也无记录，则显示“没有需要审批的记录”
+                    const reviewDiv = document.getElementById('review');
+                    reviewDiv.innerHTML = '<p>没有需要审批的记录</p>';
+                }
+            } else {
+                const data = await response.json();
+                if (currentReviewTarget === 'bottle') {
+                    fillBottleData(data);
+                } else {
+                    fillQQData(data);
+                }
+            }
+        }
+
+        function fillBottleData(data) {
             document.getElementById('id').innerText = data.id;
             document.getElementById('userid').innerText = data.userid;
             document.getElementById('groupid').innerText = data.groupid;
@@ -277,10 +333,69 @@
             document.getElementById('dislikes').innerText = data.dislikes;
             document.getElementById('blocked').innerText = data.blocked ? '是' : '否';
             document.getElementById('drawcount').innerText = data.draw_count;
-                document.getElementById('lastdrawn').innerText = data.last_drawn || '无抽取记录';
-                imgElement.onclick = function () {
-                    showImage(this.src);
-                };
+            document.getElementById('lastdrawn').innerText = data.last_drawn || '无抽取记录';
+            imgElement.onclick = function () {
+                showImage(this.src);
+            };
+        }
+
+        function fillQQData(data) {
+            // 填充QQ数据库数据
+            document.getElementById('qq').innerText = data.qq;
+            document.getElementById('love').innerText = data.love;
+            document.getElementById('alias').innerText = data.alias || '无';
+            document.getElementById('extra').innerText = data.extra || '无';
+            document.getElementById('real_id').innerText = data.real_id || '无';
+            document.getElementById('qqTimestamp').innerText = data.timestamp;
+            const imgElement = document.getElementById('qqImage');
+            imgElement.src = data.image_base64 ? `data:image/jpeg;base64,${data.image_base64}` : '';
+            imgElement.onerror = function () {
+                this.style.display = 'none';
+            };
+            imgElement.onclick = function () {
+                showImage(this.src);
+            };
+        }
+
+        async function approve() {
+            showLoading();
+            const url = currentReviewTarget === 'bottle' ? '/review' : '/qq_review';
+            const idKey = currentReviewTarget === 'bottle' ? 'id' : 'qq';
+            const idValue = document.getElementById(idKey).innerText;
+            const response = await fetch(url, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ action: 'approve', [idKey]: idValue })
+            });
+            hideLoading();
+            if (response.ok) {
+                alert('已通过！');
+                fetchReview();
+            } else {
+                alert(`通过失败。状态码: ${response.status} ${response.statusText}`);
+            }
+        }
+
+        async function reject() {
+            showLoading();
+            const url = currentReviewTarget === 'bottle' ? '/review' : '/qq_review';
+            const idKey = currentReviewTarget === 'bottle' ? 'id' : 'qq';
+            const idValue = document.getElementById(idKey).innerText;
+            const response = await fetch(url, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ action: 'reject', [idKey]: idValue })
+            });
+            hideLoading();
+            if (response.ok) {
+                alert('已拒绝！');
+                fetchReview();
+            } else {
+                alert(`拒绝失败。状态码: ${response.status} ${response.statusText}`);
             }
         }
 
@@ -302,42 +417,6 @@
         function hideLoading() {
             document.getElementById('loading').classList.add('hidden');
         }
-
-    async function approve() {
-        showLoading();
-        const response = await fetch('/review', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({ action: 'approve', id: document.getElementById('id').innerText })
-        });
-        hideLoading();
-        if (response.ok) {
-            alert('已通过！');
-            fetchReview();
-        } else {
-            alert(`通过失败。状态码: ${response.status} ${response.statusText}`);
-        }
-    }
-
-    async function reject() {
-        showLoading();
-        const response = await fetch('/review', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({ action: 'reject', id: document.getElementById('id').innerText })
-        });
-        hideLoading();
-        if (response.ok) {
-            alert('已拒绝！');
-            fetchReview();
-        } else {
-            alert(`拒绝失败。状态码: ${response.status} ${response.statusText}`);
-        }
-    }
     </script>
 </body>
 
