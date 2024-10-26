@@ -8,7 +8,7 @@ from .others import DailyCacheDecorator, tell_record, read_five_tells, code_reco
 from .draftbottles import DraftBottle, start_server, init_app
 from .wordbank import group_del, group_write, lock_row, load_info, find_row, del_row,  init_wordbank
 from .Grouper import GroupMembers
-from .battlefieldQueen import NFManager
+from .battlefieldQueue import NFManager
 from threading import Thread
 import re
 import asyncio
