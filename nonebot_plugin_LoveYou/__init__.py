@@ -3,7 +3,7 @@ from nonebot import logger   # noqa
 DATA_DIR = os.path.join(os.path.dirname(__file__), 'LoveYou_data')  # noqa
 logger.info(f'LoveYou数据目录{DATA_DIR}')   # noqa
 from .message_handler import start_bot, init_msg
-from .love_manager import db_path, update_love, get_both_love, get_range, generate_codes, read_love
+from .love_manager import db_path, update_love, get_both_love, get_range, read_love
 from .AI_chat import qingyunke, baidu_ai,  love_score, new_msg_judge
 from .others import image_to_base64
 from .wordbank import get_global_reply, groups_reply, pic_support, RL_support
@@ -35,9 +35,9 @@ driver = get_driver()
 @driver.on_startup
 async def start():
     await start_bot()
-    global Draft, black_white_list, admin_group, groupmember, app, Msg_Transmitter, msg_checker,super_admins
+    global Draft, black_white_list, admin_group, groupmember, app, Msg_Transmitter, msg_checker, super_admins
     msg_checker = init_msg()
-    from .message_handler import Draft, black_white_list, admin_group, groupmember, app, Msg_Transmitter,super_admins
+    from .message_handler import Draft, black_white_list, admin_group, groupmember, app, Msg_Transmitter, super_admins
 
 
 rule = is_type(PrivateMessageEvent, GroupMessageEvent)
@@ -75,7 +75,7 @@ async def join_new_group(bot: Bot, event: GroupIncreaseNoticeEvent):
             return msg.replace('/群绑定 ', '', 1), new_event
         elif msg == '/群绑定':
             await bot.send(new_event, '格式错误喵~\n正确格式: /群绑定 [群号]')
-    real_id, new_event = await get_reply.wait(timeout=180, default=None)
+    real_id, new_event = await get_reply.wait(timeout=180, default=(None, None))
     if real_id:
         exist_id = await Draft.set_real_group(groupid, real_id)
         if exist_id:
