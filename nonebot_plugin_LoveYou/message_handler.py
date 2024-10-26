@@ -2,15 +2,21 @@ import asyncio
 from abc import ABC, abstractmethod
 from typing import List, Dict, Any, TypedDict, Union, Set, Optional
 from nonebot.exception import StopPropagation
-from .love_manager import db_path, update_love, update_alias, read_alias, get_both_love, read_pic, find_qq_by_alias, start_db, del_qq_record, info_qq, read_love, get_loverank, get_range, replace_qq, read_five_codes, generate_codes, check_code, decrement_count, write_str_love, write_pic, global_compare, get_low_ten_qqs, get_real_id, update_real_id
+from .love_manager import db_path, update_love, update_alias, read_alias, get_both_love, read_pic, find_qq_by_conditions, start_db, del_qq_record, info_qq, read_love, get_loverank, get_range, replace_qq, read_five_codes, generate_codes, check_code, decrement_count, write_str_love, write_pic, global_compare, get_low_ten_qqs, get_real_id, update_real_id
 from .AI_chat import clear_memory
 from .others import DailyCacheDecorator, tell_record, read_five_tells, code_record, check_images_similarity, download, check_group_folder, find_images
 from .draftbottles import DraftBottle, start_server, init_app
 from .wordbank import group_del, group_write, lock_row, load_info, find_row, del_row,  init_wordbank
 from .Grouper import GroupMembers
+from .battlefieldQueen import NFManager
 from threading import Thread
 import re
 import asyncio
+import sqlite3
+from PIL import Image
+import base64
+import httpx
+import io
 import random
 import time
 import os
@@ -36,13 +42,14 @@ rule = is_type(PrivateMessageEvent,
 
 
 async def start_bot():
-    global Draft, admin_group, Msg_Transmitter, daily_decorator, black_white_list, super_admins, app, groupmember
+    global Draft, admin_group, Msg_Transmitter, daily_decorator, black_white_list, super_admins, app, groupmember, bf_nf
     Draft = DraftBottle()
     admin_group = AdminManager()
     Msg_Transmitter = MsgManager()
     daily_decorator = DailyCacheDecorator()
     black_white_list = BlackWhiteList()
     groupmember = GroupMembers()
+    bf_nf = NFManager()
     init_wordbank()
     start_db()
     await Msg_Transmitter.load_data()
@@ -76,6 +83,52 @@ class Handler(ABC):
     def is_group_admin(self, qq: str, groupid: str) -> Optional[str]:
         return 'high' if self.is_super_admin(qq) else admin_group.check_admin(groupid, qq)
 
+    def is_PrivateMessageEvent(self, event: Union[GroupMessageEvent, PrivateMessageEvent]):
+        return event.message_type == 'private'
+
+
+class GetCode(Handler):
+    def __init__(self, block: bool = True):
+        super().__init__(block)
+
+    async def handle(self, bot: Bot, event: Union[GroupMessageEvent, PrivateMessageEvent], msg: str, qq: str, groupid: str, image: Optional[str], ** kwargs: Any) -> None:
+        if qq == master and self.is_PrivateMessageEvent(event):
+            msg = msg.replace('/code ', '', 1)
+            tells = await read_five_codes(msg)
+            message = f'适用于{msg}的密码'
+            formatted_message = '\n'.join([message] + tells)
+            await bot.send(event, formatted_message)
+
+
+class SuperAdminCommandHandler(Handler):
+    def __init__(self, block: bool = True) -> None:
+        super().__init__(block)
+
+    async def handle(self, bot: Bot, event: Union[GroupMessageEvent, PrivateMessageEvent], msg: str, qq: str, groupid: str, image: Optional[str], **kwargs: Any) -> None:
+        if qq == master:
+            if msg.startswith('/sa add '):
+                target = msg.replace('/sa add ', '', 1)
+                await self.process_super_admin_action(target, 'add', bot, event)
+            elif msg.startswith('/sa del '):
+                target = msg.replace('/sa del ', '', 1)
+                await self.process_super_admin_action(target, 'remove', bot, event)
+
+    async def process_super_admin_action(self, target: str, action: str, bot: Bot, event: Union[GroupMessageEvent, PrivateMessageEvent]) -> None:
+        global super_admins
+        if action == 'add':
+            if target not in super_admins:
+                super_admins = await super_admin_action(target, 'add')
+                await bot.send(event, f'已尝试添加{target}为超管')
+            else:
+                await bot.send(event, f'{target}已经是超管')
+        elif action == 'remove':
+            if target in super_admins:
+                super_admins = await super_admin_action(target, 'remove')
+                await bot.send(event, f'已尝试取消{target}为超管')
+            else:
+                await bot.send(event, f'{target}不是超管')
+        logger.debug(f'执行了超管操作：{action} {target}')
+
 
 class GetUserID(Handler):
     def __init__(self, block: bool = True):
@@ -84,6 +137,66 @@ class GetUserID(Handler):
     async def handle(self, bot: Bot, event: Union[GroupMessageEvent, PrivateMessageEvent], msg: str, qq: str, groupid: str, image: Optional[str], ** kwargs: Any) -> None:
         await bot.send(event, f'你的ID是{qq}')
         logger.debug('ID查询')
+
+
+class BF_addQueen(Handler):
+    def __init__(self, block: bool = True):
+        super().__init__(block)
+
+    async def handle(self, bot: Bot, event: Union[GroupMessageEvent, PrivateMessageEvent], msg: str, qq: str, groupid: str, image: Optional[str], ** kwargs: Any) -> None:
+        if groupid!='143':
+            return
+        name = msg.replace("/addnf ", "", 1)
+        result=bf_nf.check_server_exists(name)
+        try:
+            await bf_nf.add_nf(name, type=1, qq=qq)
+            if result:
+                await bot.send(event, f"{name} 已添加入列表。请使用 战地1小电视 手动搜索，确认你的目标服务器位于服务器搜索结果第一位")
+            else:
+                await bot.send(event, f'{name} 已添加入列表,但未查询到该服务器')
+        except sqlite3.IntegrityError:
+            await bot.send(event, '该服务器已存在于队列,添加失败')
+
+
+class BF_removeQueen(Handler):
+    def __init__(self, block: bool = True):
+        super().__init__(block)
+
+    async def handle(self, bot: Bot, event: Union[GroupMessageEvent, PrivateMessageEvent], msg: str, qq: str, groupid: str, image: Optional[str], ** kwargs: Any) -> None:
+        if groupid!='143':
+            return
+        name = msg.replace("/delnf ", "", 1)
+        await bf_nf.cancel_nf(name)
+        await bot.send(event, f"{name} 已移出列表")
+
+
+class BF_showQueen(Handler):
+    def __init__(self, block: bool = True):
+        super().__init__(block)
+
+    async def handle(self, bot: Bot, event: Union[GroupMessageEvent, PrivateMessageEvent], msg: str, qq: str, groupid: str, image: Optional[str], ** kwargs: Any) -> None:
+        record = await bf_nf.show_nf(1)
+        top_record = record['top_record']
+        if not top_record:
+            msg_to_send = f"\n当前正在暖服 {top_record['name']}:\n未查询到详细信息"
+            msg_to_send2 = '\n'.join(f"{record['name']}  : {record['time']}" for record in records)
+            await bot.send(event, f'{msg_to_send}\n暖服队列:\n{msg_to_send2}')
+            return
+        records = record['records']
+        msg_to_send = f"\n当前正在暖服 {top_record['name']}:\n{top_record["prefix"]}\n人数: {
+            top_record["playerAmount"]}/{top_record["maxPlayers"]}   地图:{top_record["currentMap"]}"
+        msg_to_send2 = '\n'.join(f"{record['name']}  : {record['time']}" for record in records)
+        await bot.send(event, f'{msg_to_send}\n暖服队列:\n{msg_to_send2}')
+
+
+class GetWebCode(Handler):
+    def __init__(self, block: bool = True):
+        super().__init__(block)
+
+    async def handle(self, bot: Bot, event: Union[GroupMessageEvent, PrivateMessageEvent], msg: str, qq: str, groupid: str, image: Optional[str], ** kwargs: Any) -> None:
+        if self.is_super_admin(qq) and self.is_PrivateMessageEvent(event):
+            code = app.generate_webcode()
+            await bot.send(event, f'请在30s内使用秘钥\n{code}')
 
 
 class GetGroupID(Handler):
@@ -100,7 +213,30 @@ class DFpic(Handler):
         super().__init__(block)
 
     async def handle(self, bot: Bot, event: Union[GroupMessageEvent, PrivateMessageEvent], msg: str, qq: str, groupid: str, image: Optional[str], ** kwargs: Any) -> None:
-        await bot.send(event, MessageSegment.image("https://img.paulzzh.com/touhou/random"))
+        image_url = "https://img.paulzzh.com/touhou/random?size=all&size=konachan"
+        async with httpx.AsyncClient() as client:
+            response = await client.get(image_url, follow_redirects=True)
+
+            # 将HTTP响应内容读入BytesIO对象
+            image_data = io.BytesIO(response.content)
+
+            # 使用Pillow打开图片
+        try:
+            img = Image.open(image_data)
+
+            jpeg_image_data = io.BytesIO()
+            img.save(jpeg_image_data, format='JPEG', quality=30)
+            jpeg_image_data.seek(0)  # 重置文件指针到开始位置
+
+            # 将图片数据编码为base64
+            base64_encoded = base64.b64encode(
+                jpeg_image_data.getvalue()).decode('utf-8')
+
+            # 发送base64编码的图片
+            await bot.send(event, MessageSegment.image(f'base64://{base64_encoded}'))
+        except:
+            await bot.send(event, "无法获取图片，请稍后再试喵~")
+            raise
 
 
 class DraftThrow(Handler):
@@ -129,7 +265,7 @@ class DraftThrow(Handler):
 \n当参数为love时,目标只能是两个值,且必须为*或数字,而且第一个值不大于第二个值""")
             return
         try:
-            bottleid = Draft.insert_bottle(qq, msg, groupid, image)
+            bottleid = await Draft.insert_bottle(qq, msg, groupid, image)
         except ValueError:
             await bot.send(event, f'\n你发送的图片过大,无法上传。漂流瓶被{bot_name}吃了喵~')
             raise StopPropagation
@@ -145,7 +281,7 @@ class DraftSeeSee(Handler):
         if not self.is_super_admin(qq):
             return
         msg = msg.replace('/bo开盒 ', '', 1).replace('/bo开盒', '', 1)
-        ids = Draft.get_bottle_ids_by_userid(msg)
+        ids = await Draft.get_bottle_ids_by_userid(msg)
         if not ids:
             await bot.send(event, f'\n{msg}没有任何漂流瓶记录')
             return
@@ -160,11 +296,11 @@ class DraftGetter(Handler):
 
     async def handle(self,  bot: Bot, event: Union[GroupMessageEvent, PrivateMessageEvent], msg: str, qq: str, groupid: str, image: Optional[str], ** kwargs: Any) -> None:
         try:
-            bottle = Draft.get_bottle(groupid)
+            bottle = await Draft.get_bottle(groupid)
             if bottle:
                 boid = bottle['id']
                 bomessage: str = bottle['message']
-                bomessage = Draft.msg_process(bomessage, qq, groupid)
+                bomessage = await Draft.msg_process(bomessage, qq, groupid)
                 likes = bottle['likes']
                 dislikes = bottle['dislikes']
                 image = bottle['image_base64']
@@ -196,7 +332,7 @@ class DraftType(Handler):
         super().__init__(block)
 
     async def handle(self, bot: Bot, event: Union[GroupMessageEvent, PrivateMessageEvent], msg: str, qq: str, groupid: str, image: Optional[str], ** kwargs: Any) -> None:
-        type = Draft.get_types_for_groupid(groupid)
+        type = await Draft.get_types_for_groupid(groupid)
         await bot.send(event, f'本群漂流瓶类型为 {type}')
         logger.debug('查询漂流瓶群聊类型')
 
@@ -212,7 +348,7 @@ class DraftHappy(Handler):
         if not msg:
             await bot.send(event, '请给出要点赞的漂流瓶编号喵~')
             return
-        success = Draft.like_bottle(qq, msg)
+        success = await Draft.like_bottle(qq, msg)
         if success:
             await update_love(qq, -2)
             await bot.send(event, '成功点赞喵~')
@@ -233,7 +369,7 @@ class DraftShit(Handler):
         if not msg:
             await bot.send(event, '请给出要点踩的漂流瓶编号喵~')
             return
-        success = Draft.dislike_bottle(qq, msg)
+        success = await Draft.dislike_bottle(qq, msg)
         if success:
             await bot.send(event, '成功点踩喵~')
             logger.debug('点踩成功')
@@ -250,11 +386,11 @@ class DraftClean(Handler):
         if not self.is_super_admin(qq):
             return
         try:
-            Draft.clean_old_bottles()
+            await Draft.clean_old_bottles()
             await bot.send(event, '成功结算漂流瓶好感度奖励')
         except:
             await bot.send(event, '处理错误')
-            return
+            raise
         await super_admin_record(f'{qq}执行了漂流瓶结算')
         logger.info('漂流瓶结算')
 
@@ -271,7 +407,7 @@ class DraftBlock(Handler):
             await bot.send(event, '请给出要屏蔽的漂流瓶编号喵~')
             return
         try:
-            Draft.block_bottle(msg)
+            await Draft.block_bottle(msg)
             await bot.send(event, '成功屏蔽喵~')
             logger.debug(f'{qq}屏蔽了{msg}')
         except:
@@ -290,7 +426,7 @@ class DraftUnBlock(Handler):
             await bot.send(event, '请给出要屏蔽的漂流瓶编号喵~')
             return
         try:
-            Draft.unblock_bottle(msg)
+            await Draft.unblock_bottle(msg)
             await bot.send(event, '成功解除屏蔽喵~')
             logger.debug(f'{qq}解除屏蔽了{msg}')
             await super_admin_record(f'{qq}解除了{msg}的屏蔽')
@@ -305,7 +441,7 @@ class DraftTypeList(Handler):
     async def handle(self, bot: Bot, event: Union[GroupMessageEvent, PrivateMessageEvent], msg: str, qq: str, groupid: str, image: Optional[str], ** kwargs: Any) -> None:
         if not self.is_group_admin(qq, groupid):
             return
-        list = Draft.list_types()
+        list = await Draft.list_types()
         reply = "\n".join(f"{key}：{value}" for key, value in list)
         await bot.send(event, f'\n各群聊类型如下\n{reply}')
 
@@ -318,18 +454,18 @@ class DraftChangeType(Handler):
         if not self.is_group_admin(qq, groupid):
             return
         msg = msg.replace('/ChangeGtype ', '',
-                          1).replace('/ChangeGtype', '', 1)
+                          1).replace("/ChangeGtype ", '', 1)
         check = sensitive_word(msg)
         if check:
             await bot.send(event, f'你发送的类型因为 {check} 被{bot_name}吃掉了')
             return
-        list = msg.split(' ')
-        if not list:
+        listt = msg.split(' ')
+        if not listt:
             await bot.send(event, '你没有指定类型喵~')
             return
-        Draft.modify_type(groupid, list)
+        await Draft.modify_type(groupid, listt)
         await bot.send(event, '本群漂流瓶类型修改完成了喵~')
-        logger.debug(f'{groupid}修改漂流瓶类型为{list}')
+        logger.debug(f'{groupid}修改漂流瓶类型为{listt}')
 
 
 class LoveChange(Handler):
@@ -441,36 +577,38 @@ class OpenYou(Handler):
     def __init__(self, block: bool = True):
         super().__init__(block)
 
-    async def handle(self, bot: Bot, event: Union[GroupMessageEvent, PrivateMessageEvent], msg: str, qq: str, groupid: str, image: Optional[str], ** kwargs: Any) -> None:
+    async def handle(self, bot: Bot, event: Union[GroupMessageEvent, PrivateMessageEvent], msg: str, qq: str, groupid: str, image: Optional[str], **kwargs: Any) -> None:
         if not self.is_super_admin(qq):
             return
-        target_alias = msg.replace('/开盒 ', '', 1)
-        await bot.send(event, "\n如无补充信息,请回复任意信息\n如有补充,在120秒内按照 [参数]=[数值] 格式补充\n以','分隔参数")
-        await super_admin_record(f'{qq}定向查询了{target_alias}的数据')
-        logger.debug(f'尝试匹配{target_alias}')
 
-        @waiter(waits=["message"], keep_session=True, rule=rule)
-        async def get_reply(event2: Union[GroupMessageEvent, PrivateMessageEvent]):
-            """等待指定用户回复"""
-            return event2.get_plaintext()
-        new_msg = await get_reply.wait(timeout=120, default=None)
-        if not new_msg:
-            return
+        target = msg.replace('/开盒 ', '', 1)
+
+        # 记录管理员操作
+        asyncio.create_task(super_admin_record(f'{qq} 定向开盒 {target}'))
 
         try:
-            items = new_msg.split(',')
-            search_dict = {item.split('=')[0].strip(): item.split('=')[
-                1] for item in items}
+            # 使用正则表达式解析消息中的条件
+            pattern = re.compile(r'(\w+)\s*=\s*([^,，]+)\s*(?=,|，|$)')
+            matches = pattern.findall(target)
 
-            result = await find_qq_by_alias(target_alias, search_dict)
-        except IndexError:
-            result = await find_qq_by_alias(target_alias)
+            # 构建搜索字典
+            search_dict = {key: value for key, value in matches}
+
+            # 如果没有找到任何键值对，假设整个字符串是一个别名
+            if not search_dict and target:
+                search_dict['alias'] = target
+
+            # 调用查找函数
+            result, conditions = await find_qq_by_conditions(search_dict)
         except Exception as e:
-            logger.warning(e)
+            logger.warning(f"处理错误: {e}")
             await bot.send(event, '处理错误,请检查输入格式')
             return
+
+        # 构建回复消息
+        condition_str = ', '.join([f"{k}={v}" for k, v in conditions.items()])
         reply = '\n'.join(result)
-        await bot.send(event, f'\n可能的结果如下:\n{reply}')
+        await bot.send(event, f'\n基于 {condition_str} 查询,可能的结果如下:\n{reply}')
 
 
 class KillYou(Handler):
@@ -976,6 +1114,48 @@ class CodeAlias(CodeHandler):
         return f'您的QQ别名已设置为: {value} 喵~'
 
 
+class EnCode(Handler):
+    def __init__(self, block: bool = True) -> None:
+        super().__init__(block)
+
+    async def handle(self, bot: Bot, event: Union[GroupMessageEvent, PrivateMessageEvent], msg: str, qq: str, groupid: str, image: Optional[str], **kwargs: Any) -> None:
+        if not (qq == master and self.is_PrivateMessageEvent(event)):
+            return
+
+        if msg.startswith('/encode alias '):
+            await self.encode_command(bot, event, msg, 0, 'alias')
+        elif msg.startswith('/encode love '):
+            await self.encode_command(bot, event, msg, 1, 'love')
+        elif msg.startswith('/encode pic '):
+            await self.encode_command(bot, event, msg, 2, 'pic')
+
+    async def encode_command(self, bot: Bot, event: PrivateMessageEvent, msg: str, b: int, log_prefix: str):
+        msg = msg.replace(f'/encode {log_prefix} ', '', 1)
+        await bot.send(event, '确认无误请回复"确认"')
+        logger.debug(f'{log_prefix}生成中')
+
+        # 等待用户回复
+        @waiter(waits=["message"], keep_session=True, rule=rule)
+        async def get_reply(event: PrivateMessageEvent):
+            """等待指定用户回复"""
+            return event.get_plaintext()
+
+        new_msg = await get_reply.wait(timeout=120, default=None)
+        if new_msg == '确认':
+            try:
+                msg = int(msg)
+                await generate_codes(msg, b)
+                await bot.send(event, '生成完毕')
+                logger.debug(f'{log_prefix}生成完毕')
+            except Exception as e:
+                logger.debug(e)
+                await bot.send(event, '数值不合法')
+                logger.debug(f'{log_prefix}生成失败')
+        else:
+            await bot.send(event, '已取消code生成')
+            logger.debug(f'{log_prefix}取消生成')
+
+
 class CodeLove(CodeHandler):
     def __init__(self, block: bool = True):
         super().__init__(block, code_type='love')
@@ -1027,7 +1207,7 @@ class WhitelistBlacklistHandler(Handler):
             await bot.send(event, '权限不足喵~')
             return
 
-        match = re.match(r'/([add|del])\s*([white|black])\s*([gu])(\d+)', msg)
+        match = re.match(r'/(add|del)\s*(white|black)\s*([gu])(\d+)', msg)
         if not match:
             await bot.send(event, '指令格式错误喵~')
             return
@@ -1052,23 +1232,23 @@ class WhitelistBlacklistHandler(Handler):
     async def add_to_list(self, list_type: str, target_type: str, target: str, operator: str) -> tuple:
         if list_type == 'whitelist':
             result = await black_white_list.add_to_whitelist(target_type, target)
-            await super_admin_record(f'{operator}将 {target} 添加为{target_type[:-3]}白名单')
-            logger.debug(f'{target} 添加为{target_type[:-3]}白名单')
+            await super_admin_record(f'{operator}将 {target} 添加为{target_type}白名单')
+            logger.debug(f'{target} 添加为{target_type}白名单')
         elif list_type == 'blacklist':
             result = await black_white_list.add_to_blacklist(target_type, target)
-            await super_admin_record(f'{operator}将 {target} 添加为{target_type[:-3]}黑名单')
-            logger.debug(f'{target} 添加为{target_type[:-3]}黑名单')
+            await super_admin_record(f'{operator}将 {target} 添加为{target_type}黑名单')
+            logger.debug(f'{target} 添加为{target_type}黑名单')
         return result
 
     async def remove_from_list(self, list_type: str, target_type: str, target: str, operator: str) -> tuple:
         if list_type == 'whitelist':
             result = await black_white_list.remove_from_whitelist(target_type, target)
-            await super_admin_record(f'{operator}将 {target} 移除{target_type[:-3]}白名单')
-            logger.debug(f'{target} 移除{target_type[:-3]}白名单')
+            await super_admin_record(f'{operator}将 {target} 移除{target_type}白名单')
+            logger.debug(f'{target} 移除{target_type}白名单')
         elif list_type == 'blacklist':
             result = await black_white_list.remove_from_blacklist(target_type, target)
-            await super_admin_record(f'{operator}将 {target} 移除{target_type[:-3]}黑名单')
-            logger.debug(f'{target} 移除{target_type[:-3]}黑名单')
+            await super_admin_record(f'{operator}将 {target} 移除{target_type}黑名单')
+            logger.debug(f'{target} 移除{target_type}黑名单')
         return result
 
 
@@ -1124,12 +1304,12 @@ class LoveMy(Handler):
     async def remove_from_list(self, list_type: str, target_type: str, target: str, operator: str) -> tuple:
         if list_type == 'whitelist':
             result = await black_white_list.remove_from_whitelist(target_type, target)
-            await super_admin_record(f'{operator}将 {target} 移除{target_type[:-3]}白名单')
-            logger.debug(f'{target} 移除{target_type[:-3]}白名单')
+            await super_admin_record(f'{operator}将 {target} 移除{target_type}白名单')
+            logger.debug(f'{target} 移除{target_type}白名单')
         elif list_type == 'blacklist':
             result = await black_white_list.remove_from_blacklist(target_type, target)
-            await super_admin_record(f'{operator}将 {target} 移除{target_type[:-3]}黑名单')
-            logger.debug(f'{target} 移除{target_type[:-3]}黑名单')
+            await super_admin_record(f'{operator}将 {target} 移除{target_type}黑名单')
+            logger.debug(f'{target} 移除{target_type}黑名单')
         return result
 
 
@@ -1145,7 +1325,7 @@ class DraftInfo(Handler):
             await bot.send(event, '请给出要检查的漂流瓶编号喵~')
             return
         try:
-            bottle = Draft.get_bottle_by_id_bo(msg)
+            bottle = await Draft.get_bottle_by_id_bo(msg)
             if bottle:
                 boid = bottle['id']
                 userid = bottle['userid']
@@ -1274,7 +1454,9 @@ def init_msg():
         (frozenset(['/好感排行 ', '/好感排行']), [LoveRank()]),
         (frozenset(['/好人榜', '/好人榜 ']), [LoveLowRank()]),
         (frozenset(['/本群好感排行 ', '/本群好感排行']),
-         [LoveGroupRank()])
+         [LoveGroupRank()]),
+        (frozenset(['/web', '/web ']), [GetWebCode()]),
+        (frozenset(['/nf', '/nf ']), [BF_showQueen()])
     ]
     a_startswitch = [
         ('/扔漂流瓶', [DraftThrow()]),
@@ -1310,7 +1492,12 @@ def init_msg():
         ('/info ', [InfoReply()]),
         ('/code alias ', [CodeAlias()]),
         ('/code love ', [CodeLove()]),
-        ('/code pic ', [CodePic()])
+        ('/code pic ', [CodePic()]),
+        ('/code ', [GetCode()]),
+        ('/sa ', [SuperAdminCommandHandler()]),
+        ('/addnf ', [BF_addQueen()]),
+        ('/delnf ', [BF_removeQueen()]),
+        ('/encode ', [EnCode()])
     ]
 
     equals = []

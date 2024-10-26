@@ -21,7 +21,7 @@ from .config import result
     lv1_reply, lv2_reply, lv3_reply, lv4_reply, lv5_reply, memory
 ) = result
 
-db_path = os.path.join(DATA_DIR, "qq.db3")
+db_path = os.path.join(DATA_DIR, 'DataBase', 'users', 'qq.db3')
 
 
 class AdminManager:
@@ -37,8 +37,7 @@ class AdminManager:
         try:
             with open(self.filename, 'r') as file:
                 return json.load(file, strict=False)
-        except Exception as e:
-            logger.warning(f"Error loading admin data: {e}")
+        except FileNotFoundError:
             return {}
 
     async def save_admin(self):
@@ -147,6 +146,11 @@ class MsgManager:
                         pass  # 触发数据保存
                     return str(value)
         return None
+    
+    async def get_and_send_Msg(self,bot,event,qq=None, groupid=None):
+        reply = await self.get_Msg(qq, groupid)
+        if reply:
+            await bot.send(event, f'\n主人有话给您:\n{reply}')
 
     async def set_Msg(self, qq=None, value=None, groupid=None):
         '''异步设置消息'''
@@ -247,7 +251,7 @@ class BlackWhiteList:
                 # 序列化为JSON字符串并写入文件
                 await file.write(json.dumps(data, indent=4, ensure_ascii=False))
 
-    async def _check_in_table(self, id: str, db_path: str = os.path.join(DATA_DIR, "qq.db3")) -> bool:
+    async def _check_in_table(self, id: str, db_path: str = db_path) -> bool:
         """
         异步检查给定的ID是否存在于指定的数据库表中。
 
@@ -414,7 +418,7 @@ async def super_admin_action(qq_number: str, action: str, ADMIN_FILE: Path = os.
                     async with aiofiles.open(ADMIN_FILE, mode='w', encoding='utf-8') as file:
                         await file.write(json.dumps(admins, indent=4, ensure_ascii=False))
 
-        return admins
+        return set(admins)
     except Exception as e:
         logger.warning(f"发生错误: {e}")
-        return []
+        return ()

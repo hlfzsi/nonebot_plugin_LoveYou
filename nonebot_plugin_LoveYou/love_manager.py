@@ -1,5 +1,6 @@
 from .config import result
 from . import DATA_DIR
+from .connection_pool import SQLitePool
 
 from nonebot import logger
 import sqlite3
@@ -11,7 +12,7 @@ from PIL import Image
 import base64
 import string
 import random
-from typing import List, Optional, Dict, Tuple
+from typing import List, Optional, Dict, Tuple, Set
 (
     bot_name, baseline, rate, master,
     search_love_reply, botreact, model, role,
@@ -20,7 +21,13 @@ from typing import List, Optional, Dict, Tuple
     Le, Lf, Lg, Lh, Li, Lj,
     lv1_reply, lv2_reply, lv3_reply, lv4_reply, lv5_reply, memory
 ) = result
-db_path = os.path.join(DATA_DIR, 'qq.db3')
+db_path = os.path.join(DATA_DIR, 'DataBase', 'users', 'qq.db3')
+db_dir = os.path.dirname(db_path)
+if not os.path.exists(db_dir):
+    os.makedirs(db_dir, exist_ok=True)
+
+
+qq_pool = SQLitePool(db_file=db_path, max_size=10)
 
 
 def start_db():
@@ -30,6 +37,11 @@ def start_db():
         # 尝试连接数据库，如果文件不存在则会自动创建
         with sqlite3.connect(db_path) as conn:
             cursor = conn.cursor()
+            # 检查并设置WAL模式
+            cursor.execute("PRAGMA journal_mode")
+            current_journal_mode = cursor.fetchone()[0]
+            if current_journal_mode != 'wal':
+                cursor.execute("PRAGMA journal_mode=WAL")
             # 定义表名和列信息
             tables = [
                 {
@@ -41,7 +53,7 @@ def start_db():
                         ('extra', 'TEXT', 'DEFAULT ""'),
                         ('pic', 'BLOB'),
                         ('real_id', 'TEXT', 'UNIQUE'),
-                        ('state', 'INTEGER', 'DEFAULT 0')
+                        ('state', 'INTEGER', 'DEFAULT 200')
                     ],
                     'indexes': [
                         ('idx_real_id', 'real_id'),
@@ -135,7 +147,6 @@ def get_range(value: int) -> Optional[int]:
     for lower_bound, upper_bound in ranges:
         if lower_bound <= value < upper_bound:
             level = ranges[(lower_bound, upper_bound)]
-            logger.debug(f'获得lv{level}')
             return level
 
     # 如果没有找到匹配的范围
@@ -155,40 +166,63 @@ async def replace_qq(qq: str) -> str:
 
 
 async def del_qq_record(qq: str, columns_to_reset: List[str]) -> bool:
+    """
+    删除或重置指定QQ号码的记录。
+
+    参数:
+    qq (str): QQ号码。
+    columns_to_reset (List[str]): 要重置的列名列表。如果为空，则删除整条记录。
+
+    返回:
+    bool: 操作成功返回True，失败返回False。
+    """
+
+    async def execute_operation(conn: aiosqlite.Connection) -> bool:
+        """ 执行删除或重置操作 """
+        cursor = await conn.cursor()
+
+        # 首先检查qq是否存在于数据库中
+        await cursor.execute('SELECT QQ FROM qq_love WHERE QQ = ?', (qq,))
+        if await cursor.fetchone() is None:
+            # 如果找不到对应的QQ，直接返回
+            return False
+
+        if not columns_to_reset or columns_to_reset == ['']:
+            # 如果columns_to_reset为空或只包含空字符串，删除整条记录
+            await cursor.execute('DELETE FROM qq_love WHERE QQ = ?', (qq,))
+        else:
+            set_clauses = []
+            for col in columns_to_reset:
+                if col == 'pic':
+                    set_clauses.append(f"{col} = NULL")
+                elif col in ('alias', 'extra', 'real_id'):
+                    set_clauses.append(f"{col} = ''")
+                elif col == 'love':
+                    set_clauses.append(f"{col} = 0")
+
+            set_clause = ', '.join(set_clauses)
+            query = f'''
+                UPDATE qq_love
+                SET {set_clause}
+                WHERE QQ = ?
+            '''
+            if set_clause:
+                await cursor.execute(query, (qq,))
+
+        await conn.commit()
+        return True
+
     try:
-        async with aiosqlite.connect(db_path) as conn:
-            cursor = await conn.cursor()
-
-            # 首先检查qq是否存在于数据库中
-            await cursor.execute('SELECT QQ FROM qq_love WHERE QQ = ?', (qq,))
-            if await cursor.fetchone() is None:
-                # 如果找不到对应的QQ，直接返回
-                return False
-
-            if columns_to_reset == ['']:
-                await cursor.execute('DELETE FROM qq_love WHERE QQ = ?', (qq,))
-            else:
-                set_clauses = []
-                for col in columns_to_reset:
-                    if col == 'pic':
-                        set_clauses.append(f"{col} = NULL")
-                    elif col in ['alias', 'extra']:
-                        set_clauses.append(f"{col} = ''")
-                    elif col == 'love':
-                        set_clauses.append(f"{col} = 0")
-
-                set_clause = ', '.join(set_clauses)
-                query = f'''
-                    UPDATE qq_love
-                    SET {set_clause}
-                    WHERE QQ = ?
-                '''
-                if set_clause:
-                    await cursor.execute(query, (qq,))
-
-            await conn.commit()
-            return True
+        # 使用连接池获取连接
+        async with qq_pool.connection() as conn:
+            # 执行操作
+            return await execute_operation(conn)
+    except (aiosqlite.OperationalError, aiosqlite.DatabaseError) as e:
+        # 记录数据库错误
+        logger.error(f"Database error: {e}")
+        return False
     except Exception as e:
+        # 记录其他异常
         logger.error(f"An error occurred while deleting the record: {e}")
         return False
 
@@ -197,28 +231,38 @@ async def read_extra(qq: str) -> str:
     """
     读取QQ的好感后缀
     """
-    try:
-        async with aiosqlite.connect(db_path) as conn:
-            cursor = await conn.cursor()
+    async def execute_query(conn: aiosqlite.Connection) -> str:
+        """ 执行查询并处理结果 """
+        cursor = await conn.cursor()
 
-            # 尝试从qq_love表中读取extra
+        # 尝试从qq_love表中读取extra
+        await cursor.execute('''
+            SELECT extra FROM qq_love WHERE QQ = ?;
+        ''', (qq,))
+        result = await cursor.fetchone()
+
+        if result is None:
+            # 如果没有找到，插入新记录
             await cursor.execute('''
-                SELECT extra FROM qq_love WHERE QQ = ?;
+                INSERT INTO qq_love (QQ, love, alias, extra, pic) VALUES (?, 0, '', '', zeroblob(0));
             ''', (qq,))
-            result = await cursor.fetchone()
+            await conn.commit()
+            return ''
+        else:
+            # 如果找到了，返回extra
+            return result[0] or ''
 
-            if result is None:
-                # 如果没有找到，插入新记录
-                await cursor.execute('''
-                    INSERT INTO qq_love (QQ, love, alias, extra, pic) VALUES (?, 0, '', '', zeroblob(0));
-                ''', (qq,))
-                await conn.commit()
-                return ''
-            else:
-                # 如果找到了，返回extra
-                return result[0] or ''
+    try:
+        # 使用连接池获取连接
+        async with qq_pool.connection() as conn:
+            # 执行查询
+            return await execute_query(conn)
+    except (aiosqlite.OperationalError, aiosqlite.DatabaseError) as e:
+        # 记录数据库错误
+        logger.warning(f"Database error: {e}")
+        return ''
     except Exception as e:
-        # 记录错误信息
+        # 记录其他异常
         logger.warning(f"An error occurred while reading extra: {e}")
         return ''
 
@@ -229,18 +273,29 @@ async def get_real_id(qq: str) -> Optional[str]:
 
     如果找不到对应记录，则返回None。
     """
+
+    async def execute_query(conn: aiosqlite.Connection) -> Optional[str]:
+        """ 执行查询并处理结果 """
+        cursor = await conn.cursor()
+
+        # 查询数据
+        await cursor.execute('SELECT real_id FROM qq_love WHERE QQ = ?', (qq,))
+        result = await cursor.fetchone()
+
+        # 返回结果
+        return result[0] if result else None
+
     try:
-        async with aiosqlite.connect(db_path) as conn:
-            cursor = await conn.cursor()
-
-            # 查询数据
-            await cursor.execute('SELECT real_id FROM qq_love WHERE QQ = ?', (qq,))
-            result = await cursor.fetchone()
-
-            # 返回结果
-            return result[0] if result else None
+        # 使用连接池获取连接
+        async with qq_pool.connection() as conn:
+            # 执行查询
+            return await execute_query(conn)
+    except (aiosqlite.OperationalError, aiosqlite.DatabaseError) as e:
+        # 记录数据库错误
+        logger.warning(f"Database error: {e}")
+        return None
     except Exception as e:
-        # 记录错误信息
+        # 记录其他异常
         logger.warning(f"An error occurred while fetching real_id: {e}")
         return None
 
@@ -251,17 +306,28 @@ async def get_qq_by_real_id(real_id: str) -> str:
 
     如果找不到对应的记录，则返回real_id。
     """
+
+    async def execute_query(conn: aiosqlite.Connection) -> str:
+        """ 执行查询并处理结果 """
+        cursor = await conn.cursor()
+
+        # 查询数据
+        await cursor.execute('SELECT QQ FROM qq_love WHERE real_id = ?', (real_id,))
+        result = await cursor.fetchone()
+
+        # 返回结果
+        return result[0] if result else real_id
+
     try:
-        async with aiosqlite.connect(db_path) as conn:
-            cursor = await conn.cursor()
-
-            # 查询数据
-            await cursor.execute('SELECT QQ FROM qq_love WHERE real_id = ?', (real_id,))
-            result = await cursor.fetchone()
-
-            # 返回结果
-            return result[0] if result else real_id
-    except:
+        # 使用连接池获取连接
+        async with qq_pool.connection() as conn:
+            return await execute_query(conn)
+    except (aiosqlite.OperationalError, aiosqlite.DatabaseError) as e:
+        # 记录数据库错误
+        logger.warning(f"Database error: {e}")
+        return real_id
+    except Exception as e:
+        logger.warning(f"An error occurred while fetching QQ by real_id: {e}")
         return real_id
 
 
@@ -269,27 +335,38 @@ async def update_real_id(qq: str, real_id: str) -> None:
     """
     更新指定QQ在qq_love表中的real_id值。如果real_id已存在，则抛出异常。
     """
+
+    async def execute_update(conn: aiosqlite.Connection) -> None:
+        """ 执行更新操作 """
+        cursor = await conn.cursor()
+
+        # 首先检查real_id是否已存在
+        await cursor.execute('SELECT 1 FROM qq_love WHERE real_id = ?', (real_id,))
+        if await cursor.fetchone():
+            raise ValueError("The real_id already exists in the database.")
+
+        # 更新数据
+        await cursor.execute('UPDATE qq_love SET real_id = ? WHERE QQ = ?', (real_id, qq))
+
+        # 检查是否更新成功
+        if cursor.rowcount == 0:
+            # 如果没有更新任何行，那么尝试插入新记录
+            await cursor.execute('INSERT INTO qq_love (QQ, real_id) VALUES (?, ?)', (qq, real_id))
+
+        # 提交事务
+        await conn.commit()
+
     try:
-        async with aiosqlite.connect(db_path) as conn:
-            cursor = await conn.cursor()
-
-            # 首先检查real_id是否已存在
-            await cursor.execute('SELECT 1 FROM qq_love WHERE real_id = ?', (real_id,))
-            if await cursor.fetchone():
-                raise ValueError("The real_id already exists in the database.")
-
-            # 更新数据
-            await cursor.execute('UPDATE qq_love SET real_id = ? WHERE QQ = ?', (real_id, qq))
-
-            # 检查是否更新成功
-            if cursor.rowcount == 0:
-                # 如果没有更新任何行，那么尝试插入新记录
-                await cursor.execute('INSERT INTO qq_love (QQ, real_id) VALUES (?, ?)', (qq, real_id))
-
-            # 提交事务
-            await conn.commit()
+        # 使用连接池获取连接
+        async with qq_pool.connection() as conn:
+            # 执行更新操作
+            await execute_update(conn)
+    except (aiosqlite.OperationalError, aiosqlite.DatabaseError) as e:
+        # 记录数据库错误
+        logger.warning(f"Database error: {e}")
+        raise
     except Exception as e:
-        # 记录错误信息
+        # 记录其他异常
         logger.warning(f"An error occurred while updating real_id: {e}")
         raise
 
@@ -298,20 +375,30 @@ async def write_str_love(qq: str, str_value: str) -> None:
     """
     更新或插入QQ的好感后缀。
     """
+
+    async def execute_write(conn: aiosqlite.Connection) -> None:
+        """ 执行写入操作 """
+        cursor = await conn.cursor()
+
+        # 更新或插入数据
+        await cursor.execute('''
+            INSERT INTO qq_love (QQ, extra) VALUES (?, ?)
+            ON CONFLICT(QQ) DO UPDATE SET extra=excluded.extra;
+        ''', (qq, str_value))
+
+        # 提交事务
+        await conn.commit()
+
     try:
-        async with aiosqlite.connect(db_path) as conn:
-            cursor = await conn.cursor()
-
-            # 更新或插入数据
-            await cursor.execute('''
-                INSERT INTO qq_love (QQ, extra) VALUES (?, ?)
-                ON CONFLICT(QQ) DO UPDATE SET extra=excluded.extra;
-            ''', (qq, str_value))
-
-            # 提交事务
-            await conn.commit()
+        # 使用连接池获取连接
+        async with qq_pool.connection() as conn:
+            # 执行写入操作
+            await execute_write(conn)
+    except (aiosqlite.OperationalError, aiosqlite.DatabaseError) as e:
+        # 记录数据库错误
+        logger.warning(f"Database error: {e}")
     except Exception as e:
-        # 记录错误信息
+        # 记录其他异常
         logger.warning(f"An error occurred while writing extra: {e}")
 
 
@@ -319,12 +406,13 @@ async def write_pic(qq: str, pic_url: str) -> None:
     """
     下载图片并将其保存到数据库。
     """
-    try:
-        # 下载图片
+
+    async def download_and_convert_image(pic_url: str) -> bytes:
+        """ 下载图片并转换为JPEG格式的字节数据 """
         async with httpx.AsyncClient() as client:
             response = await client.get(pic_url)
             response.raise_for_status()  # 抛出HTTP错误
-            response_content = response.read()
+            response_content = response.content
 
         # 使用PIL将图片数据转换为Image对象
         image = Image.open(io.BytesIO(response_content))
@@ -332,32 +420,47 @@ async def write_pic(qq: str, pic_url: str) -> None:
         # 将图片转换为JPEG格式
         output = io.BytesIO()
         image.convert("RGB").save(output, format="JPEG")
-        jpeg_data = output.getvalue()
+        return output.getvalue()
 
-        # 连接到数据库
-        async with aiosqlite.connect(db_path) as conn:
-            cursor = await conn.cursor()
+    async def execute_write(conn: aiosqlite.Connection, qq: str, jpeg_data: bytes) -> None:
+        """ 执行写入操作 """
+        cursor = await conn.cursor()
 
-            # 检查qq_love表中是否已有该QQ的记录
-            await cursor.execute('SELECT pic FROM qq_love WHERE QQ = ?', (qq,))
-            result = await cursor.fetchone()
+        # 检查qq_love表中是否已有该QQ的记录
+        await cursor.execute('SELECT pic FROM qq_love WHERE QQ = ?', (qq,))
+        result = await cursor.fetchone()
 
-            if result is None:
-                # 如果没有找到，插入新记录
-                await cursor.execute('''
-                    INSERT INTO qq_love (QQ, love, alias, extra, pic) VALUES (?, 0, '', '', ?);
-                ''', (qq, jpeg_data))
-            else:
-                # 如果找到了，更新pic字段
-                await cursor.execute(
-                    'UPDATE qq_love SET pic = ?, state = 0 WHERE QQ = ?', (
-                        jpeg_data, qq)
-                )
+        if result is None:
+            # 如果没有找到，插入新记录
+            await cursor.execute('''
+                INSERT INTO qq_love (QQ, love, alias, extra, pic,state) VALUES (?, 0, '', '', ?,0);
+            ''', (qq, jpeg_data))
+        else:
+            # 如果找到了，更新pic字段
+            await cursor.execute(
+                'UPDATE qq_love SET pic = ?, state = 0 WHERE QQ = ?', (
+                    jpeg_data, qq)
+            )
 
-            # 提交事务
-            await conn.commit()
+        # 提交事务
+        await conn.commit()
+
+    try:
+        # 下载并转换图片
+        jpeg_data = await download_and_convert_image(pic_url)
+
+        # 使用连接池获取连接
+        async with qq_pool.connection() as conn:
+            # 执行写入操作
+            await execute_write(conn, qq, jpeg_data)
+    except (aiosqlite.OperationalError, aiosqlite.DatabaseError) as e:
+        # 记录数据库错误
+        logger.warning(f"Database error: {e}")
+    except httpx.HTTPStatusError as e:
+        # 记录HTTP请求错误
+        logger.warning(f"HTTP error while downloading the picture: {e}")
     except Exception as e:
-        # 记录错误信息
+        # 记录其他异常
         logger.warning(f"An error occurred while writing the picture: {e}")
 
 
@@ -372,9 +475,13 @@ async def decrement_count(code_to_decrement: str, code_type: str) -> int:
     返回:
     int: 减1后的count值。
     """
-    async with aiosqlite.connect(db_path) as db:
+
+    async def execute_decrement(conn: aiosqlite.Connection, code_to_decrement: str, code_type: str) -> int:
+        """ 执行减1操作 """
+        cursor = await conn.cursor()
+
         # 查询code是否存在及其count值
-        cursor = await db.execute('SELECT code, count FROM code WHERE code = ? AND type = ?', (code_to_decrement, code_type))
+        await cursor.execute('SELECT code, count FROM code WHERE code = ? AND type = ?', (code_to_decrement, code_type))
         result = await cursor.fetchone()
         await cursor.close()  # 关闭游标
 
@@ -388,17 +495,31 @@ async def decrement_count(code_to_decrement: str, code_type: str) -> int:
             new_count = count - 1
             if new_count <= 0:
                 # 如果减1后count小于等于0，则删除记录
-                await db.execute('DELETE FROM code WHERE code = ? AND type = ?', (code_to_decrement, code_type))
-                await db.commit()
+                await cursor.execute('DELETE FROM code WHERE code = ? AND type = ?', (code_to_decrement, code_type))
+                await conn.commit()
                 return -1
             else:
                 # 如果减1后count大于0，则更新count
-                await db.execute('UPDATE code SET count = ? WHERE code = ? AND type = ?', (new_count, code_to_decrement, code_type))
-                await db.commit()
+                await cursor.execute('UPDATE code SET count = ? WHERE code = ? AND type = ?', (new_count, code_to_decrement, code_type))
+                await conn.commit()
                 return new_count
         else:
             # 如果count已经是0或负数，则不做任何操作
             return -1
+
+    try:
+        # 使用连接池获取连接
+        async with qq_pool.connection() as conn:
+            # 执行减1操作
+            return await execute_decrement(conn, code_to_decrement, code_type)
+    except (aiosqlite.OperationalError, aiosqlite.DatabaseError) as e:
+        # 记录数据库错误
+        logger.warning(f"Database error: {e}")
+        return -1
+    except Exception as e:
+        # 记录其他异常
+        logger.warning(f"An error occurred while decrementing count: {e}")
+        return -1
 
 
 async def read_five_codes(code_type: str) -> list:
@@ -412,83 +533,97 @@ async def read_five_codes(code_type: str) -> list:
     list: 包含前五个userid为空的code记录的列表。
     """
 
-    try:
-        async with aiosqlite.connect(db_path) as db:
-            # 查询userid为空的前五个指定类型的code
-            cursor = await db.execute(
-                'SELECT code FROM code WHERE type = ? AND userid = "" LIMIT 5;', (
-                    code_type,)
-            )
-            codes = await cursor.fetchall()
-            # 关闭游标
-            await cursor.close()
+    async def execute_query(conn: aiosqlite.Connection, code_type: str) -> list:
+        """ 执行查询操作 """
+        cursor = await conn.cursor()
+
+        # 查询userid为空的前五个指定类型的code
+        await cursor.execute(
+            'SELECT code FROM code WHERE type = ? AND userid = "" LIMIT 5;', (
+                code_type,)
+        )
+        codes = await cursor.fetchall()
+        await cursor.close()  # 关闭游标
 
         # 将结果转换成只包含code的列表
         codes_only = [row[0] for row in codes]
 
         return codes_only
 
+    try:
+        # 使用连接池获取连接
+        async with qq_pool.connection() as conn:
+            # 执行查询操作
+            return await execute_query(conn, code_type)
+    except (aiosqlite.OperationalError, aiosqlite.DatabaseError) as e:
+        # 记录数据库错误
+        logger.warning(f"Database error: {e}")
+        return []
     except Exception as e:
-        logger.warning(f"读取数据库时发生错误: {e}")
+        # 记录其他异常
+        logger.warning(f"An error occurred while reading five codes: {e}")
         return []
 
 
-async def find_qq_by_alias(alias: str, additional_filters: Dict[str, str] = None) -> List[str]:
+async def find_qq_by_conditions(conditions: Dict[str, str]) -> Tuple[List[str], Dict[str, str]]:
     """
-    根据别名和附加过滤条件查找QQ号码。
+    根据给定的条件查找QQ号码，并返回匹配的QQ号码列表及最终使用的过滤条件。
 
     参数:
-    alias (str): 别名。
-    additional_filters (dict): 额外的过滤条件，如 {'love': '1', 'extra': 'some_value'}。
+    conditions (dict): 过滤条件，如 {'alias': 'some_alias', 'love': '1', 'extra': 'some_value'}。
 
     返回:
-    List[str]: 匹配的QQ号码列表。
+    Tuple[List[str], Dict[str, str]]: 包含匹配的QQ号码列表和最终使用的过滤条件。
     """
+
+    async def execute_query(conn: aiosqlite.Connection, conditions: Dict[str, str]) -> Tuple[List[str], Dict[str, str]]:
+        cursor = await conn.cursor()
+        
+        where_clause_parts = []
+        where_params = []
+        final_conditions = {}  # 用于存储最终使用的条件
+
+        for column, value in conditions.items():
+            if column in ('love', 'state', 'real_id'):
+                try:
+                    int(value)
+                except ValueError:
+                    continue  
+
+            if column in ('alias', 'love', 'extra', 'state', 'real_id'):
+                where_clause_parts.append(f"{column} = ?")
+                where_params.append(value)
+                final_conditions[column] = value  # 记录最终使用的条件
+
+        if not where_clause_parts:
+            # 如果没有有效的条件，则返回提示信息
+            return ['未设定条件'], {}
+
+        query = f"""
+            SELECT QQ
+            FROM qq_love
+            WHERE {' AND '.join(where_clause_parts)}
+        """
+
+        await cursor.execute(query, tuple(where_params))
+        results = await cursor.fetchall()
+        await cursor.close()
+
+        if not results:
+            return ['没有匹配结果'], final_conditions
+
+        qqs = [row[0] for row in results]
+        return qqs, final_conditions
+
     try:
-        # 异步连接到SQLite数据库
-        async with aiosqlite.connect(db_path) as conn:
-            cursor = await conn.cursor()
-
-            # 构建WHERE子句
-            where_clause_parts = ['alias = ?']
-            where_params = [alias]
-
-            if additional_filters:
-                for column, value in additional_filters.items():
-                    if column == 'love':
-                        try:
-                            value = int(value)
-                        except ValueError:
-                            continue  # 忽略这个键值对
-
-                    if column in ['love', 'extra']:
-                        where_clause_parts.append(f"{column} = ?")
-                        where_params.append(value)
-
-            # 组装完整的查询语句
-            query = f"""
-                SELECT QQ
-                FROM qq_love
-                WHERE {' AND '.join(where_clause_parts)}
-            """
-
-            # 执行查询
-            await cursor.execute(query, tuple(where_params))
-
-            # 获取所有结果
-            results = await cursor.fetchall()
-
-            if not results:
-                return ['没有匹配结果']
-
-            # 提取QQ号码
-            qqs = [row[0] for row in results]
-
-            return qqs
-
-    except aiosqlite.DatabaseError as e:
-        logger.warning(f"数据库错误: {e}")
-        return []
+        async with qq_pool.connection() as conn:
+            return await execute_query(conn, conditions or {})
+    except (aiosqlite.OperationalError, aiosqlite.DatabaseError) as e:
+        logger.warning(f"Database error: {e}")
+        return ['数据库错误'], {}
+    except Exception as e:
+        logger.warning(f"An error occurred while finding QQ by conditions: {e}")
+        return ['处理错误'], {}
 
 
 async def info_qq(qq: str) -> Optional[Dict[str, str]]:
@@ -501,43 +636,54 @@ async def info_qq(qq: str) -> Optional[Dict[str, str]]:
     返回:
     Optional[Dict[str, str]]: 包含用户信息的字典，如果没有匹配结果，则返回None。
     """
-    try:
-        # 异步连接到SQLite数据库
-        async with aiosqlite.connect(db_path) as conn:
-            cursor = await conn.cursor()
 
-            # 执行查询
-            query = """
-                SELECT alias, extra, love, pic
-                FROM qq_love
-                WHERE QQ = ?
-            """
-            await cursor.execute(query, (qq,))
+    async def execute_query(conn: aiosqlite.Connection, qq: str) -> Optional[Dict[str, str]]:
+        """ 执行查询操作 """
+        cursor = await conn.cursor()
 
-            # 获取第一条结果
-            result = await cursor.fetchone()
+        # 执行查询
+        query = """
+            SELECT alias, extra, love, pic
+            FROM qq_love
+            WHERE QQ = ?
+        """
+        await cursor.execute(query, (qq,))
 
-            if result is not None:
-                # 解码pic列（如果存在）
-                alias, extra, love, pic = result
-                if pic:
-                    pic_base64 = base64.b64encode(pic).decode('utf-8')
-                else:
-                    pic_base64 = None
+        # 获取第一条结果
+        result = await cursor.fetchone()
+        await cursor.close()  # 关闭游标
 
-                # 返回所有信息
-                return {
-                    'QQ': qq,
-                    'alias': alias,
-                    'extra': extra,
-                    'love': love,
-                    'pic': pic_base64
-                }
+        if result is not None:
+            # 解码pic列（如果存在）
+            alias, extra, love, pic = result
+            if pic:
+                pic_base64 = base64.b64encode(pic).decode('utf-8')
             else:
-                return None
+                pic_base64 = None
 
-    except aiosqlite.DatabaseError as e:
-        logger.warning(f"数据库错误: {e}")
+            # 返回所有信息
+            return {
+                'QQ': qq,
+                'alias': alias,
+                'extra': extra,
+                'love': love,
+                'pic': pic_base64
+            }
+        else:
+            return None
+
+    try:
+        # 使用连接池获取连接
+        async with qq_pool.connection() as conn:
+            # 执行查询操作
+            return await execute_query(conn, qq)
+    except (aiosqlite.OperationalError, aiosqlite.DatabaseError) as e:
+        # 记录数据库错误
+        logger.warning(f"Database error: {e}")
+        return None
+    except Exception as e:
+        # 记录其他异常
+        logger.warning(f"An error occurred while fetching QQ info: {e}")
         return None
 
 
@@ -553,24 +699,33 @@ async def update_alias(qq: str, str_value: str) -> Optional[bool]:
     Optional[bool]: 如果成功更新或插入则返回True，否则返回False。
     """
 
+    async def execute_update(conn: aiosqlite.Connection, qq: str, str_value: str) -> bool:
+        """ 执行更新操作 """
+        cursor = await conn.cursor()
+
+        # 更新或插入数据
+        await cursor.execute('''
+            INSERT INTO qq_love (QQ, alias) VALUES (?, ?)
+            ON CONFLICT(QQ) DO UPDATE SET alias=excluded.alias;
+        ''', (qq, str_value))
+
+        # 提交事务
+        await conn.commit()
+
+        return True
+
     try:
-        # 异步连接到SQLite数据库
-        async with aiosqlite.connect(db_path) as conn:
-            cursor = await conn.cursor()
-
-            # 更新或插入数据
-            await cursor.execute('''
-                INSERT INTO qq_love (QQ, alias) VALUES (?, ?)
-                ON CONFLICT(QQ) DO UPDATE SET alias=excluded.alias;
-            ''', (qq, str_value))
-
-            # 提交事务
-            await conn.commit()
-
-            return True
-
-    except aiosqlite.DatabaseError as e:
-        logger.warning(f"数据库错误: {e}")
+        # 使用连接池获取连接
+        async with qq_pool.connection() as conn:
+            # 执行更新操作
+            return await execute_update(conn, qq, str_value)
+    except (aiosqlite.OperationalError, aiosqlite.DatabaseError) as e:
+        # 记录数据库错误
+        logger.warning(f"Database error: {e}")
+        return False
+    except Exception as e:
+        # 记录其他异常
+        logger.warning(f"An error occurred while updating alias: {e}")
         return False
 
 
@@ -585,70 +740,41 @@ async def read_alias(qq: str) -> Optional[str]:
     Optional[str]: 如果找到别名则返回别名，否则返回空字符串。
     """
 
-    try:
-        # 异步连接到SQLite数据库
-        async with aiosqlite.connect(db_path) as conn:
-            cursor = await conn.cursor()
+    async def execute_query(conn: aiosqlite.Connection):
+        """ 执行查询并处理结果 """
+        cursor = await conn.cursor()
 
-            # 尝试从qq_love表中读取alias
+        # 尝试从qq_love表中读取alias
+        await cursor.execute('''
+            SELECT alias FROM qq_love WHERE QQ = ?;
+        ''', (qq,))
+        result = await cursor.fetchone()
+
+        if result is None:
+            # 如果没有找到，插入新记录
             await cursor.execute('''
-                SELECT alias FROM qq_love WHERE QQ = ?;
+                INSERT INTO qq_love (QQ, love, alias, extra, pic) VALUES (?, 0, '', '', zeroblob(0));
             ''', (qq,))
-            result = await cursor.fetchone()
-
-            if result is None:
-                # 如果没有找到，插入新记录
-                await cursor.execute('''
-                    INSERT INTO qq_love (QQ, love, alias, extra, pic) VALUES (?, 0, '', '', zeroblob(0));
-                ''', (qq,))
-                await conn.commit()
-                return ''
-            else:
-                # 如果找到了，返回alias
-                return result[0]
-
-    except aiosqlite.DatabaseError as e:
-        logger.warning(f"数据库错误: {e}")
-        return ''
-
-
-def replace_qq_sq(qq: str) -> str:
-    """
-    使用别名替代QQ。
-
-    参数:
-    qq (str): QQ号码。
-
-    返回:
-    str: 如果找到别名则返回别名，否则返回原QQ号码。
-    """
+            await conn.commit()
+            return ''
+        else:
+            # 如果找到了，返回alias
+            return result[0]
 
     try:
-        # 同步连接到SQLite数据库
-        with sqlite3.connect(db_path) as conn:
-            cursor = conn.cursor()
-
-            # 尝试从qq_love表中读取alias
-            cursor.execute('''
-                SELECT alias FROM qq_love WHERE QQ = ?;
-            ''', (qq,))
-            result = cursor.fetchone()
-
-            if result is None:
-                # 如果没有找到，插入新记录
-                cursor.execute('''
-                    INSERT INTO qq_love (QQ, love, alias, extra, pic) VALUES (?, 0, '', '', zeroblob(0));
-                ''', (qq,))
-                conn.commit()
-                return qq
-            else:
-                # 如果找到了，返回alias
-                alias = result[0]
-                return alias if alias != '' else qq
-
-    except sqlite3.DatabaseError as e:
-        logger.warning(f"数据库错误: {e}")
-        return qq
+        # 使用连接池获取连接
+        async with qq_pool.connection() as conn:
+            # 执行查询
+            return await execute_query(conn)
+    except (aiosqlite.OperationalError, aiosqlite.DatabaseError) as e:
+        # 检查连接是否仍然有效，如果无效则关闭并重新创建连接
+        conn = await qq_pool.check_connection_health(conn)
+        # 重新执行查询
+        return await execute_query(conn)
+    except Exception as e:
+        # 记录其他异常
+        logger.warning(f"其他错误: {e}")
+        return ''
 
 
 async def check_code(code_to_check: str, code_type: str, qq: str) -> bool:
@@ -663,28 +789,54 @@ async def check_code(code_to_check: str, code_type: str, qq: str) -> bool:
     返回:
     bool: 如果code存在并且userid状态符合要求，则返回True；否则返回False。
     """
-    async with aiosqlite.connect(db_path) as db:
-        cursor = await db.execute('SELECT code, userid FROM code WHERE code = ? AND type = ?', (code_to_check, code_type))
+
+    async def execute_query(conn: aiosqlite.Connection, code_to_check: str, code_type: str) -> Optional[str]:
+        """ 执行查询操作 """
+        cursor = await conn.cursor()
+
+        # 查询code和userid
+        await cursor.execute('SELECT code, userid FROM code WHERE code = ? AND type = ?', (code_to_check, code_type))
         result = await cursor.fetchone()
         await cursor.close()
 
-    if result is None:
-        # 如果code不存在
+        if result is None:
+            return None
+
+        _, userid = result
+        return userid
+
+    async def update_userid(conn: aiosqlite.Connection, code_to_check: str, code_type: str, qq: str) -> None:
+        """ 更新userid """
+        await conn.execute('UPDATE code SET userid = ? WHERE code = ? AND type = ?', (qq, code_to_check, code_type))
+        await conn.commit()
+
+    try:
+        # 使用连接池获取连接
+        async with qq_pool.connection() as conn:
+            # 执行查询操作
+            userid = await execute_query(conn, code_to_check, code_type)
+
+            if userid is None:
+                # 如果code不存在
+                return False
+
+            if userid == '':
+                # 如果userid为空，则更新userid为qq
+                await update_userid(conn, code_to_check, code_type, qq)
+                return True
+            elif userid == qq:
+                # 如果userid与传入的qq相同
+                return True
+            else:
+                # 如果userid与传入的qq不同
+                return False
+    except (aiosqlite.OperationalError, aiosqlite.DatabaseError) as e:
+        # 记录数据库错误
+        logger.warning(f"Database error: {e}")
         return False
-
-    _, userid = result
-
-    if userid == '':
-        # 如果userid为空，则更新userid为qq
-        async with aiosqlite.connect(db_path) as db:
-            await db.execute('UPDATE code SET userid = ? WHERE code = ? AND type = ?', (qq, code_to_check, code_type))
-            await db.commit()
-        return True
-    elif userid == qq:
-        # 如果userid与传入的qq相同
-        return True
-    else:
-        # 如果userid与传入的qq不同
+    except Exception as e:
+        # 记录其他异常
+        logger.warning(f"An error occurred while checking code: {e}")
         return False
 
 
@@ -700,69 +852,39 @@ async def update_love(qq: str, love: int) -> Optional[bool]:
     Optional[bool]: 如果成功更新或插入则返回True，否则返回False。
     """
 
-    try:
-        # 异步连接到SQLite数据库
-        async with aiosqlite.connect(db_path) as conn:
-            cursor = await conn.cursor()
+    async def execute_update(conn: aiosqlite.Connection, qq: str, love: int) -> bool:
+        """ 执行更新操作 """
+        cursor = await conn.cursor()
 
-            # 构造一个SQL语句，用于查找并更新
-            update_sql = "UPDATE qq_love SET love = love + ? WHERE QQ = ?"
+        # 构造一个SQL语句，用于查找并更新
+        update_sql = "UPDATE qq_love SET love = love + ? WHERE QQ = ?"
 
-            # 尝试执行更新操作
-            await cursor.execute(update_sql, (love, qq))
+        # 尝试执行更新操作
+        await cursor.execute(update_sql, (love, qq))
 
-            # 检查是否有行被更新
-            if cursor.rowcount == 0:
-                # 如果没有匹配的行被更新（即没有找到匹配的QQ），则插入新记录
-                insert_sql = "INSERT INTO qq_love (QQ, love) VALUES (?, ?)"
-                await cursor.execute(insert_sql, (qq, love))
+        # 检查是否有行被更新
+        if cursor.rowcount == 0:
+            # 如果没有匹配的行被更新（即没有找到匹配的QQ），则插入新记录
+            insert_sql = "INSERT INTO qq_love (QQ, love) VALUES (?, ?)"
+            await cursor.execute(insert_sql, (qq, love))
 
-            # 提交事务
-            await conn.commit()
-
-            return True
-
-    except aiosqlite.DatabaseError as e:
-        logger.warning(f"数据库错误: {e}")
-        return False
-
-
-def update_love_sq(qq: str, love: int) -> Optional[bool]:
-    """
-    更新用户的好感度。
-
-    参数:
-    qq (str): QQ号码。
-    love (int): 好感变化量。
-
-    返回:
-    Optional[bool]: 如果成功更新或插入则返回True，否则返回False。
-    """
-
-    try:
-        # 同步连接到SQLite数据库
-        with sqlite3.connect(db_path) as conn:
-            cursor = conn.cursor()
-
-            # 构造一个SQL语句，用于查找并更新
-            update_sql = "UPDATE qq_love SET love = love + ? WHERE QQ = ?"
-
-            # 尝试执行更新操作
-            cursor.execute(update_sql, (love, qq))
-
-            # 检查是否有行被更新
-            if cursor.rowcount == 0:
-                # 如果没有匹配的行被更新（即没有找到匹配的QQ），则插入新记录
-                insert_sql = "INSERT INTO qq_love (QQ, love) VALUES (?, ?)"
-                cursor.execute(insert_sql, (qq, love))
-
-            # 提交事务
-            conn.commit()
+        # 提交事务
+        await conn.commit()
 
         return True
 
-    except sqlite3.DatabaseError as e:
-        logger.warning(f"数据库错误: {e}")
+    try:
+        # 使用连接池获取连接
+        async with qq_pool.connection() as conn:
+            # 执行更新操作
+            return await execute_update(conn, qq, love)
+    except (aiosqlite.OperationalError, aiosqlite.DatabaseError) as e:
+        # 记录数据库错误
+        logger.warning(f"Database error: {e}")
+        return False
+    except Exception as e:
+        # 记录其他异常
+        logger.warning(f"An error occurred while updating love: {e}")
         return False
 
 
@@ -777,70 +899,39 @@ async def read_love(qq: str) -> Optional[int]:
     Optional[int]: 如果记录存在，则返回好感度值；如果记录不存在，则插入新记录并返回0。
     """
 
+    async def execute_query(conn: aiosqlite.Connection, qq: str) -> Optional[int]:
+        """ 执行查询操作 """
+        cursor = await conn.cursor()
+
+        # 尝试查询记录
+        await cursor.execute("SELECT love FROM qq_love WHERE QQ=?", (qq,))
+        result = await cursor.fetchone()
+
+        if result:
+            return result[0]
+        else:
+            # 如果记录不存在，插入新记录
+            await cursor.execute(
+                "INSERT INTO qq_love (QQ, love, alias, extra, pic) VALUES (?, 0, '', '', zeroblob(0))",
+                (qq,)
+            )
+            # 提交事务
+            await conn.commit()
+            # 新增后默认返回0
+            return 0
+
     try:
-        # 异步连接到SQLite数据库
-        async with aiosqlite.connect(db_path) as conn:
-            cursor = await conn.cursor()
-
-            # 尝试查询记录
-            await cursor.execute("SELECT love FROM qq_love WHERE QQ=?", (qq,))
-            result = await cursor.fetchone()
-
-            # 如果记录存在，返回love的值
-            if result:
-                return result[0]
-            else:
-                # 如果记录不存在，插入新记录
-                await cursor.execute(
-                    "INSERT INTO qq_love (QQ, love, alias, extra, pic) VALUES (?, 0, '', '', zeroblob(0))",
-                    (qq,)
-                )
-                # 提交事务
-                await conn.commit()
-                # 新增后默认返回0
-                return 0
-
-    except aiosqlite.DatabaseError as e:
-        logger.warning(f"数据库错误: {e}")
+        # 使用连接池获取连接
+        async with qq_pool.connection() as conn:
+            # 执行查询操作
+            return await execute_query(conn, qq)
+    except (aiosqlite.OperationalError, aiosqlite.DatabaseError) as e:
+        # 记录数据库错误
+        logger.warning(f"Database error: {e}")
         return 0
-
-
-def read_love_sq(qq: str) -> Optional[int]:
-    """
-    读取用户的当前好感度。
-
-    参数:
-    qq (str): QQ号码。
-
-    返回:
-    Optional[int]: 如果记录存在，则返回好感度值；如果记录不存在，则插入新记录并返回0。
-    """
-
-    try:
-        # 同步连接到SQLite数据库
-        with sqlite3.connect(db_path) as conn:
-            cursor = conn.cursor()
-
-            # 尝试查询记录
-            cursor.execute("SELECT love FROM qq_love WHERE QQ=?", (qq,))
-            result = cursor.fetchone()
-
-            # 如果记录存在，返回love的值
-            if result:
-                return result[0]
-            else:
-                # 如果记录不存在，插入新记录
-                cursor.execute(
-                    "INSERT INTO qq_love (QQ, love, alias, extra, pic) VALUES (?, 0, '', '', zeroblob(0))",
-                    (qq,)
-                )
-                # 提交事务
-                conn.commit()
-                # 新增后默认返回0
-                return 0
-
-    except sqlite3.DatabaseError as e:
-        logger.warning(f"数据库错误: {e}")
+    except Exception as e:
+        # 记录其他异常
+        logger.warning(f"An error occurred while reading love: {e}")
         return 0
 
 
@@ -855,37 +946,45 @@ async def get_loverank(qq: str) -> Tuple[str, str]:
     Tuple[str, str]: 用户的好感排名和整张表的记录数。
     """
 
+    async def execute_query(conn: aiosqlite.Connection, qq: str) -> Tuple[str, str]:
+        """ 执行查询操作 """
+        cursor = await conn.cursor()
+
+        # 获取总记录数
+        await cursor.execute("SELECT COUNT(*) FROM qq_love")
+        total_records = (await cursor.fetchone())[0]
+
+        await cursor.execute("""
+            WITH RankedUsers AS (
+                SELECT QQ, love, 
+                       RANK() OVER (ORDER BY love DESC) AS rank
+                FROM qq_love
+            )
+            SELECT rank
+            FROM RankedUsers
+            WHERE QQ = ?
+        """, (qq,))
+
+        rank_result = await cursor.fetchone()
+
+        if rank_result:
+            rank = rank_result[0]
+            return str(rank), str(total_records)
+        else:
+            return 'Unfound', str(total_records)
+
     try:
-        # 异步连接到SQLite数据库
-        async with aiosqlite.connect(db_path) as conn:
-            cursor = await conn.cursor()
-
-            # 获取总记录数
-            await cursor.execute("SELECT COUNT(*) FROM qq_love")
-            total_records = (await cursor.fetchone())[0]
-
-            # 使用窗口函数来获取排名
-            await cursor.execute("""
-                WITH RankedUsers AS (
-                    SELECT QQ, love, 
-                           RANK() OVER (ORDER BY love DESC) AS rank
-                    FROM qq_love
-                )
-                SELECT rank
-                FROM RankedUsers
-                WHERE QQ = ?
-            """, (qq,))
-
-            rank_result = await cursor.fetchone()
-
-            if rank_result:
-                rank = rank_result[0]
-                return str(rank), str(total_records)
-            else:
-                return 'Unfound', str(total_records)
-
-    except aiosqlite.DatabaseError as e:
-        logger.warning(f"数据库错误: {e}")
+        # 使用连接池获取连接
+        async with qq_pool.connection() as conn:
+            # 执行查询操作
+            return await execute_query(conn, qq)
+    except (aiosqlite.OperationalError, aiosqlite.DatabaseError) as e:
+        # 记录数据库错误
+        logger.warning(f"Database error: {e}")
+        return 'Error', 'Error'
+    except Exception as e:
+        # 记录其他异常
+        logger.warning(f"An error occurred while getting loverank: {e}")
         return 'Error', 'Error'
 
 
@@ -900,222 +999,236 @@ async def read_love_only(qq: str) -> Optional[int]:
     Optional[int]: 如果记录存在，则返回好感度值；如果记录不存在，则返回None。
     """
 
+    async def execute_query(conn: aiosqlite.Connection, qq: str) -> Optional[int]:
+        """ 执行查询操作 """
+        cursor = await conn.cursor()
+
+        # 尝试查询记录
+        await cursor.execute("SELECT love FROM qq_love WHERE QQ=?", (qq,))
+        result = await cursor.fetchone()
+
+        if result:
+            return result[0]
+        else:
+            return None
+
     try:
-        # 异步连接到SQLite数据库
-        async with aiosqlite.connect(db_path) as conn:
-            cursor = await conn.cursor()
-
-            # 尝试查询记录
-            await cursor.execute("SELECT love FROM qq_love WHERE QQ=?", (qq,))
-            result = await cursor.fetchone()
-
-            # 如果记录存在，返回love的值
-            if result:
-                return result[0]
-            else:
-                return None
-
-    except aiosqlite.DatabaseError as e:
-        logger.warning(f"数据库错误: {e}")
+        # 使用连接池获取连接
+        async with qq_pool.connection() as conn:
+            # 执行查询操作
+            return await execute_query(conn, qq)
+    except (aiosqlite.OperationalError, aiosqlite.DatabaseError) as e:
+        # 记录数据库错误
+        logger.warning(f"Database error: {e}")
+        return None
+    except Exception as e:
+        # 记录其他异常
+        logger.warning(f"An error occurred while reading love: {e}")
         return None
 
 
-async def get_both_love_only(qq):
+async def get_both_love_only(qq: str) -> Tuple[Optional[int], Optional[str]]:
     """
     与get_both_love函数的唯一区别在于这个函数是只读的,不会插入记录
-    """
-    # 初始化返回值
-    love = await read_love_only(qq)
-    if love != None:
-        int_love = love
-        str_love = ''
-
-        # 检查qq
-        extra = await read_extra(qq)
-        if extra != '':
-            extra = f' {extra}'
-        str_love = f'{int_love}{extra}'
-
-        # 返回两个值
-        return int_love, str_love
-
-    else:
-        return None, None
-
-
-async def get_both_love(qq: str) -> Tuple[int, str]:
-    """获得好感度,如果qq不存在则插入记录
-
-    Args:
-        qq (str):用户qq号
-
-    Returns:
-        数值好感(int),文本好感(str)
-    """
-    # 初始化返回值
-    int_love = await read_love(qq)
-    str_love = ''
-
-    # 检查qq
-    extra = await read_extra(qq)
-    if extra != '':
-        extra = f' {extra}'
-    str_love = f'{int_love}{extra}'
-
-    # 返回两个值
-    return int_love, str_love
-
-
-async def read_pic(qq: str, readonly: bool = False) -> str:
-    """
-    获得QQ的好感回复图片
-    return : base64 encoded string or ''
-    """
-    try:
-        async with aiosqlite.connect(db_path) as conn:
-            cursor = await conn.cursor()
-
-            # 尝试从qq_love表中读取pic
-            await cursor.execute('''
-                SELECT pic,state FROM qq_love WHERE QQ = ?;
-            ''', (qq,))
-            result = await cursor.fetchone()
-
-            if result is None or result[1] == 0:
-                if readonly or result[1] == 0:
-                    return ''
-                else:
-                    # 如果结果为空（即没有找到QQ），则插入新记录
-                    await cursor.execute('''
-                        INSERT INTO qq_love (QQ, love, alias, extra, pic) VALUES (?, 0, '', '', zeroblob(0));
-                    ''', (qq,))
-                    await conn.commit()
-                    return ''
-            else:
-                pic = result[0]
-                # 如果pic为None（即数据库中为NULL），返回空字符串
-                return base64.b64encode(pic).decode('utf-8') if pic is not None else ''
-    except Exception as e:
-        # 记录错误信息
-        logger.warning(f"An error occurred while reading the picture: {e}")
-        return ''
-
-
-async def del_qq_record(qq: str, columns_to_reset: List[str]) -> bool:
-    try:
-        async with aiosqlite.connect(db_path) as conn:
-            cursor = await conn.cursor()
-
-            # 首先检查qq是否存在于数据库中
-            await cursor.execute('SELECT QQ FROM qq_love WHERE QQ = ?', (qq,))
-            if await cursor.fetchone() is None:
-                # 如果找不到对应的QQ，直接返回
-                return False
-
-            if columns_to_reset == ['']:
-                await cursor.execute('DELETE FROM qq_love WHERE QQ = ?', (qq,))
-            else:
-                set_clauses = []
-                for col in columns_to_reset:
-                    if col == 'pic':
-                        set_clauses.append(f"{col} = NULL")
-                    elif col in ['alias', 'extra', 'real_id']:
-                        set_clauses.append(f"{col} = ''")
-                    elif col == 'love':
-                        set_clauses.append(f"{col} = 0")
-
-                set_clause = ', '.join(set_clauses)
-                query = f'''
-                    UPDATE qq_love
-                    SET {set_clause}
-                    WHERE QQ = ?
-                '''
-                if set_clause:
-                    await cursor.execute(query, (qq,))
-
-            await conn.commit()
-            return True
-    except Exception as e:
-        logger.error(f"An error occurred while deleting the record: {e}")
-        return False
-
-
-async def info_qq(qq: str) -> Optional[Dict[str, str]]:
-    """
-    根据QQ号码获取用户信息。
 
     参数:
     qq (str): QQ号码。
 
     返回:
-    Optional[Dict[str, str]]: 包含用户信息的字典，如果没有匹配结果，则返回None。
+    Tuple[Optional[int], Optional[str]]: 包含整型的好感度和字符串形式的好感度（带额外信息）。
     """
+
+    async def execute_query(conn: aiosqlite.Connection, qq: str) -> Tuple[int, str]:
+        """ 执行查询操作 """
+        cursor = await conn.cursor()
+
+        # 尝试查询记录
+        await cursor.execute("""
+            SELECT love, extra
+            FROM qq_love
+            WHERE QQ=?
+        """, (qq,))
+        result = await cursor.fetchone()
+
+        if result:
+            love, extra = result
+        else:
+            extra = ''
+
+        # 返回两个值
+        str_love = f'{love}{f" {extra}" if extra else ""}'
+        return love, str_love
+
     try:
-        # 异步连接到SQLite数据库
-        async with aiosqlite.connect(db_path) as conn:
-            cursor = await conn.cursor()
+        # 使用连接池获取连接
+        async with qq_pool.connection() as conn:
+            # 执行查询操作
+            return await execute_query(conn, qq)
+    except (aiosqlite.OperationalError, aiosqlite.DatabaseError) as e:
+        # 记录数据库错误
+        logger.warning(f"Database error: {e}")
+        return 0, 'Error'
+    except Exception as e:
+        # 记录其他异常
+        logger.warning(f"An error occurred while getting both love: {e}")
+        return 0, 'Error'
 
-            # 执行查询
-            query = """
-                SELECT alias, extra, love, pic
-                FROM qq_love
-                WHERE QQ = ?
-            """
-            await cursor.execute(query, (qq,))
 
-            # 获取第一条结果
-            result = await cursor.fetchone()
+async def get_both_love(qq: str) -> Tuple[int, str]:
+    """
+    获得好感度，如果qq不存在则插入记录。
 
-            if result is not None:
-                # 解码pic列（如果存在）
-                alias, extra, love, pic = result
-                if pic:
-                    pic_base64 = base64.b64encode(pic).decode('utf-8')
-                else:
-                    pic_base64 = None
+    参数:
+    qq (str): 用户QQ号。
 
-                # 返回所有信息
-                return {
-                    'QQ': qq,
-                    'alias': alias,
-                    'extra': extra,
-                    'love': love,
-                    'pic': pic_base64
-                }
+    返回:
+    Tuple[int, str]: 数值好感度和文本好感度。
+    """
+
+    async def execute_query(conn: aiosqlite.Connection, qq: str) -> Tuple[int, str]:
+        """ 执行查询操作 """
+        cursor = await conn.cursor()
+
+        # 尝试查询记录
+        await cursor.execute("""
+            SELECT love, extra
+            FROM qq_love
+            WHERE QQ=?
+        """, (qq,))
+        result = await cursor.fetchone()
+
+        if result:
+            love, extra = result
+        else:
+            # 如果记录不存在，插入新记录
+            await cursor.execute(
+                "INSERT INTO qq_love (QQ, love, alias, extra, pic) VALUES (?, 0, '', '', zeroblob(0))",
+                (qq,)
+            )
+            # 提交事务
+            await conn.commit()
+            love = 0
+            extra = ''
+
+        # 返回两个值
+        str_love = f'{love}{f" {extra}" if extra else ""}'
+        return love, str_love
+
+    try:
+        # 使用连接池获取连接
+        async with qq_pool.connection() as conn:
+            # 执行查询操作
+            return await execute_query(conn, qq)
+    except (aiosqlite.OperationalError, aiosqlite.DatabaseError) as e:
+        # 记录数据库错误
+        logger.warning(f"Database error: {e}")
+        return 0, 'Error'
+    except Exception as e:
+        # 记录其他异常
+        logger.warning(f"An error occurred while getting both love: {e}")
+        return 0, 'Error'
+
+
+async def read_pic(qq: str, readonly: bool = False) -> str:
+    """
+    获得QQ的好感回复图片。
+
+    参数:
+    qq (str): QQ号码。
+    readonly (bool, optional): 如果为True，则不插入新记录。默认为False。
+
+    返回:
+    str: base64编码的字符串或空字符串。
+    """
+
+    async def execute_query(conn: aiosqlite.Connection, qq: str, readonly: bool) -> str:
+        """ 执行查询操作 """
+        cursor = await conn.cursor()
+
+        # 尝试从qq_love表中读取pic
+        await cursor.execute('''
+            SELECT pic, state FROM qq_love WHERE QQ = ?;
+        ''', (qq,))
+        result = await cursor.fetchone()
+
+        if result is None or result[1] == 0:
+            if readonly or result[1] == 0:
+                return ''
             else:
-                return None
+                # 如果结果为空（即没有找到QQ），则插入新记录
+                await cursor.execute('''
+                    INSERT INTO qq_love (QQ, love, alias, extra, pic) VALUES (?, 0, '', '', zeroblob(0));
+                ''', (qq,))
+                await conn.commit()
+                return ''
+        else:
+            pic = result[0]
+            # 如果pic为None（即数据库中为NULL），返回空字符串
+            return base64.b64encode(pic).decode('utf-8') if pic is not None else ''
 
-    except aiosqlite.DatabaseError as e:
-        logger.warning(f"数据库错误: {e}")
-        return None
+    try:
+        # 使用连接池获取连接
+        async with qq_pool.connection() as conn:
+            # 执行查询操作
+            return await execute_query(conn, qq, readonly)
+    except (aiosqlite.OperationalError, aiosqlite.DatabaseError) as e:
+        # 记录数据库错误
+        logger.warning(f"Database error: {e}")
+        return ''
+    except Exception as e:
+        # 记录其他异常
+        logger.warning(f"An error occurred while reading the picture: {e}")
+        return ''
 
 
-async def generate_codes(a, b):
-    '''
-    a为数目,b为类型
-    '''
+async def generate_codes(a: int, b: int) -> None:
+    """
+    生成指定数量和类型的code。
+
+    参数:
+    a (int): 生成的code数量。
+    b (int): code的类型（0: alias, 1: love, 2: pic）。
+    """
+
+    # 确保a和b是整数
     a = int(a)
     b = int(b)
+
+    # 定义字符集
     characters = string.ascii_letters + string.digits
+
+    # 类型映射
     type_map = {0: 'alias', 1: 'love', 2: 'pic'}
     code_type = type_map.get(b, 'alias')
 
-    async with aiosqlite.connect(db_path) as db:
-        # 确保我们有足够的唯一code
-        generated_count = 0
-        while generated_count < a:
-            # 一次性生成多个code以提高效率
-            new_codes = {''.join(random.choices(characters, k=8))
-                         for _ in range(a - generated_count)}
+    async def insert_codes(conn: aiosqlite.Connection, codes: Set[str], code_type: str) -> int:
+        """ 执行插入操作并返回成功插入的code数量 """
+        try:
+            await conn.executemany('INSERT INTO code (code, type) VALUES (?, ?)', [(code, code_type) for code in codes])
+            await conn.commit()
+            return len(codes)
+        except aiosqlite.IntegrityError:
+            # 如果有code冲突，则忽略错误并再次尝试生成新的code
+            return 0
 
-            # 尝试插入新的code
-            try:
-                await db.executemany('INSERT INTO code (code, type) VALUES (?, ?)', [(code, code_type) for code in new_codes])
-                await db.commit()
-                generated_count += len(new_codes)
-            except aiosqlite.IntegrityError:
-                # 如果有code冲突，则忽略错误并再次尝试生成新的code
-                pass
+    try:
+        # 使用连接池获取连接
+        async with qq_pool.connection() as conn:
+            generated_count = 0
+            while generated_count < a:
+                # 一次性生成多个code以提高效率
+                new_codes = {''.join(random.choices(characters, k=8))
+                             for _ in range(a - generated_count)}
+
+                # 尝试插入新的code
+                inserted_count = await insert_codes(conn, new_codes, code_type)
+                generated_count += inserted_count
+    except (aiosqlite.OperationalError, aiosqlite.DatabaseError) as e:
+        # 记录数据库错误
+        logger.warning(f"Database error: {e}")
+    except Exception as e:
+        # 记录其他异常
+        logger.warning(f"An error occurred while generating codes: {e}")
 
 
 async def get_low_ten_qqs() -> List[str]:
@@ -1126,25 +1239,33 @@ async def get_low_ten_qqs() -> List[str]:
     List[str]: 包含好感度最低的前10名用户的QQ号列表。
     """
 
+    async def execute_query(conn: aiosqlite.Connection) -> List[str]:
+        """ 执行查询操作 """
+        cursor = await conn.cursor()
+
+        # 执行 SQL 查询语句
+        query = "SELECT QQ FROM qq_love ORDER BY love ASC LIMIT 10"
+        await cursor.execute(query)
+
+        # 获取查询结果，并转换为列表
+        results = await cursor.fetchall()
+        low_ten_qqs = [row[0] for row in results]
+
+        return low_ten_qqs
+
     try:
-        # 异步连接到SQLite数据库
-        async with aiosqlite.connect(db_path) as conn:
-            cursor = await conn.cursor()
-
-            # 执行 SQL 查询语句
-            query = "SELECT QQ FROM qq_love ORDER BY love ASC LIMIT 10"
-            await cursor.execute(query)
-
-            # 获取查询结果，并转换为列表
-            results = await cursor.fetchall()
-            low_ten_qqs = [row[0] for row in results]
-
-            # 返回结果列表
-            return low_ten_qqs
-
-    except aiosqlite.DatabaseError as e:
-        # 如果出现错误，打印错误信息并返回空列表
-        logger.warning(f"数据库错误: {e}")
+        # 使用连接池获取连接
+        async with qq_pool.connection() as conn:
+            # 执行查询操作
+            return await execute_query(conn)
+    except (aiosqlite.OperationalError, aiosqlite.DatabaseError) as e:
+        # 记录数据库错误
+        logger.warning(f"Database error: {e}")
+        return []
+    except Exception as e:
+        # 记录其他异常
+        logger.warning(
+            f"An error occurred while getting the lowest ten QQS: {e}")
         return []
 
 
@@ -1156,57 +1277,34 @@ async def global_compare() -> List[str]:
     List[str]: 包含好感度最高的前10名用户的QQ号列表。
     """
 
+    async def execute_query(conn: aiosqlite.Connection) -> List[str]:
+        """ 执行查询操作 """
+        cursor = await conn.cursor()
+
+        # 编写SQL查询语句
+        sql = "SELECT QQ FROM qq_love ORDER BY love DESC LIMIT 10"
+
+        # 执行SQL查询
+        await cursor.execute(sql)
+
+        # 获取查询结果
+        results = await cursor.fetchall()
+
+        # 处理查询结果
+        qq_list = [row[0] for row in results]
+
+        return qq_list
+
     try:
-        # 异步连接到SQLite数据库
-        async with aiosqlite.connect(db_path) as conn:
-            cursor = await conn.cursor()
-
-            # 编写SQL查询语句
-            sql = "SELECT QQ FROM qq_love ORDER BY love DESC LIMIT 10"
-
-            # 执行SQL查询
-            await cursor.execute(sql)
-
-            # 获取查询结果
-            results = await cursor.fetchall()
-
-            # 处理查询结果
-            qq_list = [row[0] for row in results]
-
-            # 返回结果列表
-            return qq_list
-
-    except aiosqlite.DatabaseError as e:
-        # 如果出现错误，打印错误信息并返回空列表
-        logger.warning(f"数据库错误: {e}")
+        # 使用连接池获取连接
+        async with qq_pool.connection() as conn:
+            # 执行查询操作
+            return await execute_query(conn)
+    except (aiosqlite.OperationalError, aiosqlite.DatabaseError) as e:
+        # 记录数据库错误
+        logger.warning(f"Database error: {e}")
         return []
-
-
-async def get_low_ten_qqs() -> List[str]:
-    """
-    查询并返回好感度最低的前10名用户的QQ号。
-
-    返回:
-    List[str]: 包含好感度最低的前10名用户的QQ号列表。
-    """
-
-    try:
-        # 异步连接到SQLite数据库
-        async with aiosqlite.connect(db_path) as conn:
-            cursor = await conn.cursor()
-
-            # 执行 SQL 查询语句
-            query = "SELECT QQ FROM qq_love ORDER BY love ASC LIMIT 10"
-            await cursor.execute(query)
-
-            # 获取查询结果，并转换为列表
-            results = await cursor.fetchall()
-            low_ten_qqs = [row[0] for row in results]
-
-            # 返回结果列表
-            return low_ten_qqs
-
-    except aiosqlite.DatabaseError as e:
-        # 如果出现错误，打印错误信息并返回空列表
-        logger.warning(f"数据库错误: {e}")
+    except Exception as e:
+        # 记录其他异常
+        logger.warning(f"An error occurred while getting the top ten QQS: {e}")
         return []

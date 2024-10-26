@@ -3,7 +3,7 @@ from nonebot import logger   # noqa
 DATA_DIR = os.path.join(os.path.dirname(__file__), 'LoveYou_data')  # noqa
 logger.info(f'LoveYou数据目录{DATA_DIR}')   # noqa
 from .message_handler import start_bot, init_msg
-from .love_manager import db_path, update_love, get_both_love, get_range, generate_codes, read_five_codes, read_love
+from .love_manager import db_path, update_love, get_both_love, get_range, generate_codes, read_love
 from .AI_chat import qingyunke, baidu_ai,  love_score, new_msg_judge
 from .others import image_to_base64
 from .wordbank import get_global_reply, groups_reply, pic_support, RL_support
@@ -11,7 +11,6 @@ import snownlp
 import re
 from typing import Union
 import asyncio
-from .perm import super_admin_action
 from .sensitive_test import sensitive_word
 from nonebot import on_message, on_notice, get_driver
 from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, PrivateMessageEvent, Message, MessageSegment
@@ -36,9 +35,9 @@ driver = get_driver()
 @driver.on_startup
 async def start():
     await start_bot()
-    global Draft, black_white_list, admin_group, groupmember, app, Msg_Transmitter, msg_checker
+    global Draft, black_white_list, admin_group, groupmember, app, Msg_Transmitter, msg_checker,super_admins
     msg_checker = init_msg()
-    from .message_handler import Draft, black_white_list, admin_group, groupmember, app, Msg_Transmitter
+    from .message_handler import Draft, black_white_list, admin_group, groupmember, app, Msg_Transmitter,super_admins
 
 
 rule = is_type(PrivateMessageEvent, GroupMessageEvent)
@@ -64,7 +63,7 @@ async def join_new_group(bot: Bot, event: GroupIncreaseNoticeEvent):
     groupid = str(event.group_id)
     logger.info(f'bot被拉入新群聊.邀请人{admin_qq}  群聊{groupid}')
     await asyncio.sleep(5)
-    await bot.send_group_msg(group_id=groupid, message='群友们好喵~\n原来是你把我拉进来的呢\n你可以在180s内@我并发送指令\n/群绑定 [群号]\n注意:绑定结果不可修改,会影响bot功能,请务必认真绑定喵~')
+    await bot.send_group_msg(group_id=groupid, message='群友们好喵~\n拉咱进群的群友可以在180s内@我并发送指令\n/群绑定 [群号]\n注意:绑定结果不可修改,会影响bot功能,请务必认真绑定喵~')
 
     @waiter(waits=["message"], keep_session=True, rule=rule)
     async def get_reply(new_event: GroupMessageEvent):
@@ -78,7 +77,7 @@ async def join_new_group(bot: Bot, event: GroupIncreaseNoticeEvent):
             await bot.send(new_event, '格式错误喵~\n正确格式: /群绑定 [群号]')
     real_id, new_event = await get_reply.wait(timeout=180, default=None)
     if real_id:
-        exist_id = Draft.set_real_group(groupid, real_id)
+        exist_id = await Draft.set_real_group(groupid, real_id)
         if exist_id:
             await bot.send(event, f'本群已经绑定为{exist_id}\n如有修改需求,请联系开发者')
             raise StopPropagation
@@ -95,10 +94,8 @@ async def pre_stage(bot: Bot, event: GroupMessageEvent):
     groupid = str(event.group_id)
     asyncio.create_task(
         groupmember.create_and_insert_if_not_exists(groupid, qq))
-    reply = await Msg_Transmitter.get_Msg(
-        qq, groupid)
-    if reply:
-        await bot.send(event, f'\n主人有话给您:\n{reply}')
+    asyncio.create_task(
+        Msg_Transmitter.get_and_send_Msg(bot, event, qq, groupid))
     group_type = await black_white_list.check_in_list('groupid', groupid)
     qq_type = await black_white_list.check_in_list('userid', qq)
     if (group_type == 'blacklist' or qq_type == 'blacklist') and (qq != master and qq not in super_admins and not qq_type == 'whitelist'):
@@ -134,34 +131,7 @@ async def fdsacfvsgv(bot: Bot, event: PrivateMessageEvent):
             break
     if msg.startswith(' '):
         msg = msg.replace(' ', '', 1)
-    msg_checker.dispatch(message=msg, bot=bot, event=event, image=image)
-    global super_admins
-    if qq == master and msg.startswith('/code '):
-
-        msg = msg.replace('/code ', '', 1)
-        tells = await read_five_codes(msg)
-        message = f'适用于{msg}的密码'
-        formatted_message = '\n'.join([message] + tells)
-        await bot.send(event, formatted_message)
-
-    elif msg == '/我的ID' or msg == '/我的ID ':
-
-        await bot.send(event, f'你的ID是{qq}')
-
-    elif msg.startswith('/sa add ') and qq == master:
-
-        target = msg.replace('/sa add ', '', 1)
-        super_admins = await super_admin_action(target, 'add')
-        await bot.send(event, f'已尝试注册{target}为超管')
-
-    elif msg.startswith('/sa del ') and qq == master:
-
-        target = msg.replace('/sa del ', '', 1)
-        super_admins = await super_admin_action(target, 'remove')
-        await bot.send(event, f'已尝试取消{target}为超管')
-
-    elif msg == '/审核模式' and qq == master:
-
+    if msg == '/审核模式' and qq == master:
         global Audit_mode
         if Audit_mode:
             Audit_mode = False
@@ -171,80 +141,8 @@ async def fdsacfvsgv(bot: Bot, event: PrivateMessageEvent):
             Audit_mode = True
             logger.warning('审核模式开启')
             await bot.send(event, '审核模式开启')
-    elif qq == master and msg.startswith('/encode alias '):
-        msg = msg.replace('/encode alias ', '')
-        b = int(0)
-        await bot.send(event, '确认无误请回复"确认"')
-        logger.debug('alias_code生成中')
-
-        @waiter(waits=["message"], keep_session=True, rule=rule)
-        async def get_reply(event: PrivateMessageEvent):
-            """等待指定用户回复"""
-            return event.get_plaintext()
-        new_msg = await get_reply.wait(timeout=120, default=None)
-        if new_msg == '确认':
-            try:
-                msg = int(msg)
-                await generate_codes(msg, b)
-                await bot.send(event, '生成完毕')
-                logger.debug('alias_code生成完毕')
-            except Exception as e:
-                logger.debug(e)
-                await bot.send(event, '数值不合法')
-                logger.debug('alias_code生成失败')
-        else:
-            await bot.send(event, '已取消code生成')
-            logger.debug('alias_code取消生成')
-    elif qq == master and msg.startswith('/encode love '):
-        msg = msg.replace('/encode love ', '')
-        b = int(1)
-        await bot.send(event, '确认无误请回复"确认"')
-        logger.debug('love_code生成中')
-
-        @waiter(waits=["message"], keep_session=True, rule=rule)
-        async def get_reply(event: PrivateMessageEvent):
-            """等待指定用户回复"""
-            return event.get_plaintext()
-        new_msg = await get_reply.wait(timeout=120, default=None)
-        if new_msg == '确认':
-            try:
-                msg = int(msg)
-                await generate_codes(msg, b)
-                await bot.send(event, '生成完毕')
-                logger.debug('love_code生成完毕')
-            except:
-                await bot.send(event, '数值不合法')
-                logger.debug('love_code生成失败')
-        else:
-            await bot.send(event, '已取消code生成')
-            logger.debug('love_code取消生成')
-    elif qq == master and msg.startswith('/encode pic '):
-        msg = msg.replace('/encode pic ', '')
-        b = int(2)
-        await bot.send(event, '确认无误请回复"确认"')
-        logger.debug('pic_code生成中')
-
-        @waiter(waits=["message"], keep_session=True, rule=rule)
-        async def get_reply(event: PrivateMessageEvent):
-            """等待指定用户回复"""
-            return event.get_plaintext()
-        new_msg = await get_reply.wait(timeout=120, default=None)
-        if new_msg == '确认':
-            try:
-                msg = int(msg)
-                await generate_codes(msg, b)
-                await bot.send(event, '生成完毕')
-                logger.debug('pic_code生成完毕')
-            except:
-                await bot.send(event, '数值不合法')
-                logger.debug('pic_code生成失败')
-        else:
-            await bot.send(event, '已取消code生成')
-            logger.debug('pic_code取消生成')
-    elif msg == '/web' and (qq == master or qq in super_admins):
-
-        code = app.generate_webcode()
-        await bot.send(event, f'请在30s内使用秘钥\n{code}')
+        raise StopPropagation
+    msg_checker.dispatch(message=msg, bot=bot, event=event, image=image)
 
 
 @second_process.handle()  # 词库功能实现

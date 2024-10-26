@@ -242,6 +242,17 @@ async def pic_reply(qq, pre_pic, name, avatarurl):
 
     avatar = np.frombuffer(image_data, dtype=np.uint8)
     avatar = cv2.imdecode(avatar, cv2.IMREAD_UNCHANGED)
+    # 将头像设置为50%透明度
+    if avatar is not None and avatar.shape[2] == 3:  # 如果没有alpha通道，添加一个
+        avatar = cv2.cvtColor(avatar, cv2.COLOR_BGR2BGRA)
+    avatar[:, :, 3] = 191
+
+    # 为头像应用圆角效果
+    height, width = avatar.shape[:2]
+    radius = min(height, width) // 2
+    mask = np.zeros((height, width), dtype=np.uint8)
+    cv2.circle(mask, (width // 2, height // 2), radius, 255, -1)
+    avatar = cv2.bitwise_and(avatar, avatar, mask=mask)
 
     cartoon_path = pick_pic(os.path.join(DATA_DIR, 'images', 'cartoon'), lv)
     if not os.path.exists(cartoon_path):
@@ -294,8 +305,8 @@ async def pic_reply(qq, pre_pic, name, avatarurl):
         return result
 
     background = merge_layers(background, model, (0, 0))
-    background = merge_layers(background, avatar, (610, 545))
-    background = merge_layers(background, cartoon, (610, 75))
+    background = merge_layers(background, avatar, (610, 75))
+    background = merge_layers(background, cartoon, (610, 545))
 
     qq = await replace_qq(qq)
     str_love = str_love.replace(' ', '\n', 1)

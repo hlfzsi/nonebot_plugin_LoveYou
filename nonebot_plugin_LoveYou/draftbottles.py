@@ -1,12 +1,13 @@
 from typing import List, Dict, Optional, Tuple
 import httpx
 import time
-import sqlite3
+import asyncio
 import io
 import random
 import base64
 import re
 import os
+import sqlite3
 from PIL import Image
 from datetime import datetime
 from aiohttp import web
@@ -15,7 +16,8 @@ import string
 
 
 from nonebot import logger
-from .love_manager import update_love_sq, read_love_sq, replace_qq_sq
+from .love_manager import read_love, replace_qq, update_love
+from .connection_pool import SQLitePool
 from . import DATA_DIR
 
 
@@ -34,78 +36,89 @@ class DraftBottle:
     漂流瓶类。
     """
 
-    def __init__(self, DB_PATH: str = os.path.join(DATA_DIR, 'DriftBottles.db3')):
+    def __init__(self, DB_PATH: str = os.path.join(DATA_DIR, 'DataBase', 'DriftBottles', 'DriftBottles.db3')):
         self.DB_PATH = DB_PATH
-        self.conn: sqlite3.Connection = None
-        self._connect()
-
-    def initialize(self) -> None:
-        self.conn.execute("""
-            CREATE TABLE IF NOT EXISTS Bottles (
-                id TEXT PRIMARY KEY UNIQUE,
-                userid TEXT,
-                message TEXT,
-                timestamp INTEGER,
-                image BLOB,
-                type TEXT,
-                likes INTEGER DEFAULT 0,
-                dislikes INTEGER DEFAULT 0,
-                blocked BOOLEAN DEFAULT 0,
-                draw_count INTEGER DEFAULT 0,
-                last_drawn INTEGER,
-                groupid TEXT,
-                state INTEGER DEFAULT 0
-            )
-        """)
-        self.conn.execute("""
-            CREATE TABLE IF NOT EXISTS Types (
-                groupid TEXT PRIMARY KEY,
-                types TEXT,
-                real_id TEXT UNIQUE
-            )
-        """)
-        self.conn.execute("""
-            CREATE TABLE IF NOT EXISTS Likes (
-                userid TEXT,
-                bottle_id TEXT,
-                timestamp INTEGER,
-                PRIMARY KEY (userid, bottle_id)
-            )
-        """)
-        # 添加索引
-        self.conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_bottle_type ON Bottles(type)")
-        self.conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_bottle_userid ON Bottles(userid)")
-        self.conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_likes_userid ON Likes(userid)")
-        self.conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_likes_bottle_id ON Likes(bottle_id)")
-
-        self.conn.commit()
-
-    def _connect(self):
-        """内部使用，用于建立数据库连接。"""
-        self.conn = sqlite3.connect(self.DB_PATH, check_same_thread=False)
+        db_dir = os.path.dirname(DB_PATH)
+        if not os.path.exists(db_dir):
+            os.makedirs(db_dir, exist_ok=True)
+        self.pool: SQLitePool = SQLitePool(self.DB_PATH, max_size=10)
         self.initialize()
 
-    def close(self) -> None:
-        """关闭数据库连接。"""
-        if self.conn:
-            self.conn.close()
-            self.conn = None
+    def initialize(self) -> None:
+        """同步初始化漂流瓶类和创建必要的表。"""
+        with sqlite3.connect(self.DB_PATH) as conn:
+            cursor = conn.cursor()
 
-    def get_bottle_ids_by_userid(self, userid: str) -> List[str]:
+            cursor.execute("PRAGMA journal_mode")
+            current_journal_mode = cursor.fetchone()[0]
+
+            if current_journal_mode != 'wal':
+                cursor.execute("PRAGMA journal_mode=WAL")
+
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS Bottles (
+                    id TEXT PRIMARY KEY UNIQUE,
+                    userid TEXT,
+                    message TEXT,
+                    timestamp INTEGER,
+                    image BLOB,
+                    type TEXT,
+                    likes INTEGER DEFAULT 0,
+                    dislikes INTEGER DEFAULT 0,
+                    blocked BOOLEAN DEFAULT 0,
+                    draw_count INTEGER DEFAULT 0,
+                    last_drawn INTEGER,
+                    groupid TEXT,
+                    state INTEGER DEFAULT 0
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS Types (
+                    groupid TEXT PRIMARY KEY,
+                    types TEXT,
+                    real_id TEXT UNIQUE
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS Likes (
+                    userid TEXT,
+                    bottle_id TEXT,
+                    timestamp INTEGER,
+                    PRIMARY KEY (userid, bottle_id)
+                )
+            """)
+
+            # 添加索引
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_bottle_userid ON Bottles(userid)")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_likes_userid_bottle_id ON Likes(userid, bottle_id)")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_types_groupid ON Types(groupid)")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_bottle_type_blocked ON Bottles(type, blocked)")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_bottle_timestamp ON Bottles(timestamp)")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_bottle_state ON Bottles(state)")
+
+            conn.commit()
+
+    async def close(self) -> None:
+        """关闭数据库连接。"""
+        await self.pool.close()
+
+    async def get_bottle_ids_by_userid(self, userid: str) -> List[str]:
         """
         返回与给定userid相关的所有漂流瓶记录的id。
         """
-        cursor = self.conn.execute(
-            "SELECT id FROM Bottles WHERE userid=?", (userid,))
-        bottle_ids = [row[0] for row in cursor]
-        cursor.close()
-        return bottle_ids
+        async with self.pool.connection() as conn:
+            cursor = await conn.execute(
+                "SELECT id FROM Bottles WHERE userid=?", (userid,))
+            bottle_ids = [row[0] async for row in cursor]
+            return bottle_ids
 
-    def insert_bottle(self, userid: str, message: str, groupid: str, image_url: str = None):
+    async def insert_bottle(self, userid: str, message: str, groupid: str, image_url: Optional[str] = None) -> str:
         """
         将用户ID和消息插入数据库，并记录时间戳。如有图片，记录图片数据。
         """
@@ -115,107 +128,110 @@ class DraftBottle:
         random.shuffle(str_list)
         bottle_id = ''.join(str_list)[:12]
 
-        # 同步获取groupid对应的types
-        types = self.get_types_for_groupid(groupid)
+        # 异步获取groupid对应的types
+        types = await self.get_types_for_groupid(groupid)
         if not types:
-            self.modify_type(groupid, ['Default'])
-            types = self.get_types_for_groupid(groupid)
+            types = ['Default']
 
-        types = random.choice(types)
+        types = next((t for t in types if t != 'all'), 'Default')
 
         image_data = None
         if image_url:
             try:
-                # 使用httpx发送GET请求
-                response = httpx.get(image_url)
+                # 使用httpx异步客户端发送GET请求
+                async with httpx.AsyncClient() as client:
+                    response = await client.get(image_url)
 
-                if response.status_code == 200:
-                    original_image_data = response.content
-                    image = Image.open(io.BytesIO(original_image_data))
+                    if response.status_code == 200:
+                        original_image_data = response.content
+                        image = Image.open(io.BytesIO(original_image_data))
 
-                    # 确保图像转换为RGB模式
-                    image = image.convert('RGB')
+                        # 确保图像转换为RGB模式
+                        image = image.convert('RGB')
 
-                    output = io.BytesIO()
-                    image.save(output, format="JPEG", quality=75)
+                        output = io.BytesIO()
+                        image.save(output, format="JPEG", quality=70)
 
-                    # 将处理后的图像数据存入image_data
-                    image_data = output.getvalue()
+                        # 将处理后的图像数据存入image_data
+                        image_data = output.getvalue()
 
-                    output.close()
+                        output.close()
 
-                    if len(original_image_data) > 400 * 1024:
-                        raise ValueError("图片过大")
-                else:
-                    raise ValueError("图片获取失败")
+                        if len(original_image_data) > 300 * 1024:
+                            raise ValueError("图片过大")
+                    else:
+                        raise ValueError("图片获取失败")
 
             except Exception as e:
                 logger.warning(f"Error fetching image: {e}")
-        # 同步执行插入操作
-        self.conn.execute(
-            """
-            INSERT INTO Bottles (id, userid, message, timestamp, image, type,groupid)
-            VALUES (?, ?, ?, ?, ?, ?,?)
-            """, (bottle_id, userid, message, timestamp, image_data, types, groupid)
-        )
-        self.conn.commit()
+
+        # 异步执行插入操作
+        async with self.pool.connection() as conn:
+            await conn.execute(
+                """
+                INSERT INTO Bottles (id, userid, message, timestamp, image, type, groupid)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (bottle_id, userid, message, timestamp, image_data, types, groupid)
+            )
+            await conn.commit()
+
         return bottle_id
 
-    def get_types_for_groupid(self, groupid: str) -> List[str]:
+    async def get_types_for_groupid(self, groupid: str) -> List[str]:
         """
-        同步获取指定groupid对应的类型列表。
+        异步获取指定groupid对应的类型列表。
         """
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT types FROM Types WHERE groupid=?", (groupid,))
-        result = cursor.fetchone()
-        cursor.close()
-        if result is not None:
-            return result[0].split(',')
-        return []
+        async with self.pool.connection() as conn:
+            cursor = await conn.execute("SELECT types FROM Types WHERE groupid=?", (groupid,))
+            result = await cursor.fetchone()
+            await cursor.close()
+            if result is not None:
+                return result[0].split(',')
+            return []
 
-    def get_real_id_for_groupid(self, groupid: str) -> str:
+    async def get_real_id_for_groupid(self, groupid: str) -> Optional[str]:
         """
-        同步获取指定groupid对应的真实ID。
+        异步获取指定groupid对应的真实ID。
         """
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT real_id FROM Types WHERE groupid=?", (groupid,))
-        result = cursor.fetchone()
-        cursor.close()
-        if result is not None:
-            return result[0]
-        return None
+        async with self.pool.connection() as conn:
+            cursor = await conn.execute("SELECT real_id FROM Types WHERE groupid=?", (groupid,))
+            result = await cursor.fetchone()
+            await cursor.close()
+            if result is not None:
+                return result[0]
+            return None
 
-    def get_bottle(self, groupid: str) -> Optional[Dict[str, str]]:
+    async def get_bottle(self, groupid: str) -> Optional[Dict[str, str]]:
         """
         随机加权取出漂流瓶，根据groupid的类型。每个漂流瓶被取出的次数越多，
         下次被抽取的概率越小。返回漂流瓶ID、消息内容、点赞数、点踩数。
         如果有图片，返回图片的base64编码。
         """
-        with self.conn:
-            cursor = self.conn.cursor()
+        async with self.pool.connection() as conn:
+            cursor = await conn.cursor()
 
-            # 获取groupid对应的类型列表
-            cursor.execute(
-                "SELECT types FROM Types WHERE groupid=?", (groupid,)
-            )
-            types_row = cursor.fetchone()
-            if types_row is None:
-                # 如果找不到groupid，则使用默认类型列表
-                types = ['Default']
+            # 异步获取groupid对应的types
+            types = await self.get_types_for_groupid(groupid) or ['all']
+
+            # 构建 SQL 查询语句
+            if 'all' in types:
+                query = """
+                    SELECT id, userid, message, image, likes, dislikes, draw_count, groupid, state
+                    FROM Bottles
+                    WHERE blocked=0
+                """
+                params = ()
             else:
-                types = [t.strip() for t in types_row[0].split(',')]
+                type_in_clause = '(' + ', '.join(['?'] * len(types)) + ')'
+                query = f"""
+                    SELECT id, userid, message, image, likes, dislikes, draw_count, groupid, state
+                    FROM Bottles
+                    WHERE type IN {type_in_clause} AND blocked=0
+                """
+                params = tuple(types)
 
-            # 构建SQL IN子句
-            type_in_clause = '(' + ', '.join(['?'] * len(types)) + ')'
-
-            # 查询所有符合条件的漂流瓶
-            cursor.execute(f"""
-                SELECT id, userid, message, image, likes, dislikes, draw_count ,groupid ,state
-                FROM Bottles
-                WHERE type IN {type_in_clause} AND blocked=0
-            """, tuple(types))
-
-            matching_bottles = cursor.fetchall()
+            await cursor.execute(query, params)
+            matching_bottles = await cursor.fetchall()
 
             if not matching_bottles:
                 # 没有找到匹配的漂流瓶
@@ -237,7 +253,7 @@ class DraftBottle:
                 matching_bottles, weights=weights)[0]
 
             bottle_id, _, message, image, likes, dislikes, _, from_groupid, state = selected_bottle
-            groupid = self.get_real_id_for_groupid(from_groupid)
+            groupid = await self.get_real_id_for_groupid(from_groupid)
 
             if image and state == 200:
                 image_base64 = base64.b64encode(image).decode('utf-8')
@@ -250,10 +266,11 @@ class DraftBottle:
 
             # 更新抽取次数和最后被抽取的时间
             current_time = int(datetime.now().timestamp())
-            cursor.execute(
+            await cursor.execute(
                 "UPDATE Bottles SET draw_count=draw_count+1, last_drawn=? WHERE id=?", (
                     current_time, bottle_id)
             )
+            await conn.commit()
 
         return {
             'id': bottle_id,
@@ -264,15 +281,14 @@ class DraftBottle:
             'groupid': groupid
         }
 
-    def set_real_group(self, groupid: str, real_id: str):
+    async def set_real_group(self, groupid: str, real_id: str) -> Optional[str]:
         """通过groupid设置真实id。"""
-        with self.conn:
-            cursor = self.conn.cursor()
+        async with self.pool.connection() as conn:
+            cursor = await conn.cursor()
 
             # 检查groupid是否已存在于Types表中
-            cursor.execute(
-                "SELECT real_id FROM Types WHERE groupid=?", (groupid,))
-            existing_row = cursor.fetchone()
+            await cursor.execute("SELECT real_id FROM Types WHERE groupid=?", (groupid,))
+            existing_row = await cursor.fetchone()
 
             if existing_row is not None:
                 # 如果groupid已存在
@@ -280,147 +296,145 @@ class DraftBottle:
                     return existing_row[0]
 
                 # 如果groupid已存在，但是real_id为null，则更新real_id
-                cursor.execute(
-                    "UPDATE Types SET real_id=? WHERE groupid=?", (real_id, groupid))
+                await cursor.execute("UPDATE Types SET real_id=? WHERE groupid=?", (real_id, groupid))
             else:
                 # 如果groupid不存在，则插入新的记录
-                cursor.execute(
-                    "INSERT INTO Types (groupid, types, real_id) VALUES (?, ?, ?)", (groupid, 'Default', real_id))
+                await cursor.execute("INSERT INTO Types (groupid, types, real_id) VALUES (?, ?, ?)", (groupid, 'Default,all', real_id))
 
-    def like_bottle(self, userid: str, bottle_id: str) -> bool:
+            await conn.commit()
+
+        return real_id
+
+    async def like_bottle(self, userid: str, bottle_id: str) -> bool:
         """
         为对应漂流瓶增加点赞数。只允许在漂流瓶被抽取后30秒内点赞，
         相同userid只能为同一漂流瓶点赞一次。
         """
         current_time = int(datetime.now().timestamp())
 
-        with self.conn:
+        async with self.pool.connection() as conn:
             # 检查是否已经点过赞
-            cursor = self.conn.execute(
+            cursor = await conn.execute(
                 "SELECT timestamp FROM Likes WHERE userid=? AND bottle_id=?", (
                     userid, bottle_id)
             )
-            if cursor.fetchone():
-                cursor.close()
+            if await cursor.fetchone():
                 return False
 
             # 获取漂流瓶最后一次被抽取的时间戳
-            cursor = self.conn.execute(
+            cursor = await conn.execute(
                 "SELECT last_drawn FROM Bottles WHERE id=?", (bottle_id,)
             )
-            last_drawn_row = cursor.fetchone()
-            cursor.close()
+            last_drawn_row = await cursor.fetchone()
             if last_drawn_row is None or current_time - last_drawn_row[0] > 30:
                 return False
 
             # 增加点赞数并记录点赞
-            self.conn.execute(
+            await conn.execute(
                 "UPDATE Bottles SET likes=likes+1 WHERE id=?", (bottle_id,)
             )
-            self.conn.execute(
+            await conn.execute(
                 "INSERT INTO Likes (userid, bottle_id, timestamp) VALUES (?, ?, ?)", (
                     userid, bottle_id, current_time)
             )
-            self.conn.commit()
+            await conn.commit()
 
         return True
 
-    def dislike_bottle(self, userid: str, bottle_id: str) -> bool:
+    async def dislike_bottle(self, userid: str, bottle_id: str) -> bool:
         """
         为对应漂流瓶增加点踩数。具体要求同点赞。
         """
         current_time = int(datetime.now().timestamp())
 
-        with self.conn:
+        async with self.pool.connection() as conn:
             # 检查是否已经点过踩
-            cursor = self.conn.execute(
+            cursor = await conn.execute(
                 "SELECT timestamp FROM Likes WHERE userid=? AND bottle_id=?", (
                     userid, bottle_id)
             )
-            if cursor.fetchone():
-                cursor.close()
+            if await cursor.fetchone():
                 return False
 
             # 获取漂流瓶最后一次被抽取的时间戳
-            cursor = self.conn.execute(
+            cursor = await conn.execute(
                 "SELECT last_drawn FROM Bottles WHERE id=?", (bottle_id,)
             )
-            last_drawn_row = cursor.fetchone()
-            cursor.close()
+            last_drawn_row = await cursor.fetchone()
             if last_drawn_row is None or current_time - last_drawn_row[0] > 30:
                 return False
 
             # 增加点踩数并记录点踩
-            self.conn.execute(
+            await conn.execute(
                 "UPDATE Bottles SET dislikes=dislikes+1 WHERE id=?", (bottle_id,)
             )
-            self.conn.execute(
+            await conn.execute(
                 "INSERT INTO Likes (userid, bottle_id, timestamp) VALUES (?, ?, ?)", (
                     userid, bottle_id, current_time)
             )
-            self.conn.commit()
+            await conn.commit()
 
         return True
 
-    def clean_old_bottles(self) -> None:
+    async def clean_old_bottles(self) -> None:
         """
-        同步清理所有存在时间超过7天的漂流瓶记录，并计算love值。
+        异步清理所有存在时间超过7天的漂流瓶记录，并计算love值。
         """
         threshold_time = int(time.time()) - 7 * 24 * 3600
+        tasks = []
 
-        with self.conn:
-            cursor = self.conn.cursor()
+        async with self.pool.connection() as conn:
+            cursor = await conn.cursor()
 
             # 获取所有过期的漂流瓶ID
-            cursor.execute(
+            await cursor.execute(
                 "SELECT id, likes, dislikes, draw_count, userid, blocked FROM Bottles WHERE timestamp<?", (threshold_time,))
-            bottles_to_clean = cursor.fetchall()
+            bottles_to_clean = await cursor.fetchall()
 
+            # 计算love值并更新用户love值
             for bottle_id, likes, dislikes, draw_count, userid, blocked in bottles_to_clean:
                 love = int(15 * (1.5 * likes - dislikes) /
                            (draw_count + likes + dislikes + 1))
                 if blocked:
                     love = -abs(love)
-                update_love_sq(userid, love)
+                tasks.append(update_love(userid, love))
 
             # 清理与这些漂流瓶相关的点赞记录
-            for bottle_id, _, _, _, _ in bottles_to_clean:
-                cursor.execute(
-                    "DELETE FROM Likes WHERE bottle_id=?", (bottle_id,))
+            for bottle_id, _, _, _, _, _ in bottles_to_clean:
+                await cursor.execute("DELETE FROM Likes WHERE bottle_id=?", (bottle_id,))
 
             # 删除漂流瓶
-            cursor.execute("DELETE FROM Bottles WHERE timestamp<?",
-                           (threshold_time,))
-            self.conn.commit()
+            await cursor.execute("DELETE FROM Bottles WHERE timestamp<?", (threshold_time,))
 
-    def block_bottle(self, bottle_id: str) -> None:
-        """
-        同步屏蔽指定漂流瓶，使其无法被抽取。
-        """
-        with self.conn:
-            self.conn.execute(
-                "UPDATE Bottles SET blocked=1 WHERE id=?", (bottle_id,))
-            self.conn.commit()
+            await conn.commit()
+        await asyncio.gather(*tasks)
 
-    def unblock_bottle(self, bottle_id: str) -> None:
+    async def block_bottle(self, bottle_id: str) -> None:
         """
-        同步解除屏蔽指定漂流瓶。
+        异步屏蔽指定漂流瓶，使其无法被抽取。
         """
-        with self.conn:
-            self.conn.execute(
-                "UPDATE Bottles SET blocked=0 WHERE id=?", (bottle_id,))
-            self.conn.commit()
+        async with self.pool.connection() as conn:
+            await conn.execute("UPDATE Bottles SET blocked=1 WHERE id=?", (bottle_id,))
+            await conn.commit()
 
-    def get_bottle_by_id_bo(self, bottle_id: str) -> Optional[dict]:
+    async def unblock_bottle(self, bottle_id: str) -> None:
         """
-        同步返回指定ID的漂流瓶信息。
+        异步解除屏蔽指定漂流瓶。
         """
-        with self.conn:
-            cursor = self.conn.execute(
+        async with self.pool.connection() as conn:
+            await conn.execute("UPDATE Bottles SET blocked=0 WHERE id=?", (bottle_id,))
+            await conn.commit()
+
+    async def get_bottle_by_id_bo(self, bottle_id: str) -> Optional[Dict]:
+        """
+        异步返回指定ID的漂流瓶信息。
+        """
+        async with self.pool.connection() as conn:
+            cursor = await conn.execute(
                 "SELECT id, userid, message, timestamp, image, likes, dislikes, blocked, draw_count, last_drawn, groupid "
                 "FROM Bottles WHERE id=?", (bottle_id,)
             )
-        bottle = cursor.fetchone()
+            bottle = await cursor.fetchone()
 
         if bottle:
             (bottle_id, userid, message, b_timestamp, image, likes,
@@ -428,11 +442,11 @@ class DraftBottle:
 
             # 处理时间戳
             if last_drawn:
-                last_drawn = datetime.fromtimestamp(last_drawn)
-                last_drawn = last_drawn.strftime('%Y-%m-%d %H:%M:%S')
+                last_drawn = datetime.fromtimestamp(
+                    last_drawn).strftime('%Y-%m-%d %H:%M:%S')
 
-            b_timestamp = datetime.fromtimestamp(b_timestamp)
-            b_timestamp = b_timestamp.strftime('%Y-%m-%d %H:%M:%S')
+            b_timestamp = datetime.fromtimestamp(
+                b_timestamp).strftime('%Y-%m-%d %H:%M:%S')
 
             # 将图片数据转换为Base64编码字符串
             if image:
@@ -440,7 +454,7 @@ class DraftBottle:
             else:
                 image_base64 = None
 
-            real_groupid = self.get_real_id_for_groupid(groupid) or groupid
+            real_groupid = await self.get_real_id_for_groupid(groupid) or groupid
 
             return {
                 'id': bottle_id,
@@ -458,42 +472,46 @@ class DraftBottle:
 
         return None
 
-    def list_types(self) -> List[Tuple[str, str]]:
+    async def list_types(self) -> List[Tuple[str, str]]:
         """
-        同步列出所有可用的类型。
+        异步列出所有可用的类型。
         """
-        with self.conn:  # 假设self.conn是sqlite3.Connection的一个实例
-            cursor = self.conn.execute("SELECT groupid, types FROM Types")
-            types = cursor.fetchall()
+        async with self.pool.connection() as conn:
+            cursor = await conn.execute("SELECT groupid, types FROM Types")
+            types = await cursor.fetchall()
         return types
 
-    def modify_type(self, groupid: str, new_types: List[str]):
+    async def modify_type(self, groupid: str, new_types: List[str]):
         """
-        同步修改groupid对应的适用类型。
+        异步修改groupid对应的适用类型。
         """
-        with self.conn:  # 使用上下文管理器自动处理事务
-            # 首先检查groupid是否存在
-            cursor = self.conn.execute(
-                "SELECT COUNT(*) FROM Types WHERE groupid=?", (groupid,)
-            )
-            count = cursor.fetchone()[0]
+        async with self.pool.connection() as conn:
+            async with conn.cursor() as cursor:
+                # 首先检查groupid是否存在
+                await cursor.execute(
+                    "SELECT COUNT(*) FROM Types WHERE groupid=?", (groupid,)
+                )
+                count = (await cursor.fetchone())[0]
 
-            if count == 0:
-                # 如果groupid不存在，则插入新记录
-                # 将new_types列表转换为字符串
-                types_str = ', '.join(new_types)
-                self.conn.execute(
-                    "INSERT INTO Types (groupid, types) VALUES (?, ?)", (
-                        groupid, types_str)
-                )
-            else:
-                # 如果groupid存在，则更新类型
-                # 将new_types列表转换为字符串
-                types_str = ', '.join(new_types)
-                self.conn.execute(
-                    "UPDATE Types SET types=? WHERE groupid=?", (
-                        types_str, groupid)
-                )
+                if count == 0:
+                    # 如果groupid不存在，则插入新记录
+                    # 将new_types列表转换为字符串
+                    types_str = ','.join(new_types)
+                    await cursor.execute(
+                        "INSERT INTO Types (groupid, types) VALUES (?, ?)", (
+                            groupid, types_str)
+                    )
+                else:
+                    # 如果groupid存在，则更新类型
+                    # 将new_types列表转换为字符串
+                    types_str = ','.join(new_types)
+                    await cursor.execute(
+                        "UPDATE Types SET types=? WHERE groupid=?", (
+                            types_str, groupid)
+                    )
+
+                # 提交事务
+                await conn.commit()
 
     def is_formated(self, input_text: str) -> bool:
         """
@@ -557,7 +575,7 @@ class DraftBottle:
         # 如果所有 [] 都符合规范，则返回 True
         return True
 
-    def msg_process(self, input_text: str, qq: str, groupid: str) -> str:
+    async def msg_process(self, input_text: str, qq: str, groupid: str) -> str:
         """处理漂流瓶自定义内容
 
         Args:
@@ -591,7 +609,7 @@ class DraftBottle:
 
             # 逻辑处理
             if arg == 'love':
-                love = read_love_sq(qq)
+                love = await read_love(qq)
                 if targets[0] == '*' and targets[1] == '*':
                     replacement = optmsg
                 elif targets[0] == '*' and love <= int(targets[1]):
@@ -613,13 +631,13 @@ class DraftBottle:
                 else:
                     replacement = elsemsg
             elif arg == 'alias':
-                alias = replace_qq_sq(qq)
+                alias = await replace_qq(qq)
                 if alias in targets:
                     replacement = optmsg
                 else:
                     replacement = elsemsg
             elif arg == 'Gtype':
-                Gtype = self.get_types_for_groupid(groupid)
+                Gtype = await self.get_types_for_groupid(groupid)
                 if not Gtype:
                     Gtype = ['Default']
                 for i in Gtype:
@@ -651,7 +669,7 @@ PASSWORD_EXPIRATION = 30  # 密码有效时间（秒）
 
 
 class ReviewApp:
-    def __init__(self, db_path=os.path.join(DATA_DIR, 'DriftBottles.db3'), qq_db_path=os.path.join(DATA_DIR, 'qq.db3')):
+    def __init__(self, db_path=os.path.join(DATA_DIR, 'DataBase', 'DriftBottles', 'DriftBottles.db3'), qq_db_path=os.path.join(DATA_DIR, 'DataBase', 'users', 'qq.db3')):
         self.app = web.Application()
         self.db_path = db_path
         self.qq_db_path = qq_db_path
@@ -859,7 +877,7 @@ class ReviewApp:
 app = None
 
 
-def init_app(db_path=os.path.join(DATA_DIR, 'DriftBottles.db3'), qq_db_path=os.path.join(DATA_DIR, 'qq.db3')):
+def init_app(db_path=os.path.join(DATA_DIR, 'DataBase', 'DriftBottles', 'DriftBottles.db3'), qq_db_path=os.path.join(DATA_DIR, 'DataBase', 'users', 'qq.db3')):
     global app
     if app is None:
         app = ReviewApp(db_path, qq_db_path)
