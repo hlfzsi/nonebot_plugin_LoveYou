@@ -144,14 +144,14 @@ class BF_addQueen(Handler):
         super().__init__(block)
 
     async def handle(self, bot: Bot, event: Union[GroupMessageEvent, PrivateMessageEvent], msg: str, qq: str, groupid: str, image: Optional[str], ** kwargs: Any) -> None:
-        if groupid!='143':
+        if not groupid in ('143','131'):
             return
         name = msg.replace("/addnf ", "", 1)
-        result=bf_nf.check_server_exists(name)
+        result=await bf_nf.check_server_exists(name)
         try:
             await bf_nf.add_nf(name, type=1, qq=qq)
             if result:
-                await bot.send(event, f"{name} 已添加入列表。请使用 战地1小电视 手动搜索，确认你的目标服务器位于服务器搜索结果第一位")
+                await bot.send(event, f"{name} 已添加入列表")
             else:
                 await bot.send(event, f'{name} 已添加入列表,但未查询到该服务器')
         except sqlite3.IntegrityError:
@@ -163,7 +163,7 @@ class BF_removeQueen(Handler):
         super().__init__(block)
 
     async def handle(self, bot: Bot, event: Union[GroupMessageEvent, PrivateMessageEvent], msg: str, qq: str, groupid: str, image: Optional[str], ** kwargs: Any) -> None:
-        if groupid!='143':
+        if not groupid in ('143','131'):
             return
         name = msg.replace("/delnf ", "", 1)
         await bf_nf.cancel_nf(name)
@@ -183,10 +183,14 @@ class BF_showQueen(Handler):
             await bot.send(event, f'{msg_to_send}\n暖服队列:\n{msg_to_send2}')
             return
         records = record['records']
+        
         msg_to_send = f"\n当前正在暖服 {top_record['name']}:\n{top_record["prefix"]}\n人数: {
             top_record["playerAmount"]}/{top_record["maxPlayers"]}   地图:{top_record["currentMap"]}"
         msg_to_send2 = '\n'.join(f"{record['name']}  : {record['time']}" for record in records)
-        await bot.send(event, f'{msg_to_send}\n暖服队列:\n{msg_to_send2}')
+        msg = Message([
+        MessageSegment.text(f'{msg_to_send}\n暖服队列:\n{msg_to_send2}')       
+    ])
+        await bot.send(event, msg)
 
 
 class GetWebCode(Handler):

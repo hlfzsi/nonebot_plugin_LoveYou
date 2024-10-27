@@ -1102,7 +1102,7 @@ async def get_both_love(qq: str) -> Tuple[int, str]:
         else:
             # 如果记录不存在，插入新记录
             await cursor.execute(
-                "INSERT INTO qq_love (QQ, love, alias, extra, pic) VALUES (?, 0, '', '', zeroblob(0))",
+                "INSERT INTO qq_love (QQ, love, alias, extra) VALUES (?, 0, '', '')",
                 (qq,)
             )
             # 提交事务

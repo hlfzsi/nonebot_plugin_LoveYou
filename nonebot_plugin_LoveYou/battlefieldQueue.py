@@ -3,6 +3,8 @@ from .connection_pool import SQLitePool
 import os
 from datetime import datetime
 import httpx
+import re
+import Levenshtein
 from . import DATA_DIR
 
 
@@ -35,7 +37,7 @@ class NFManager:
         response = await self.client.get(url)
         if response.status_code == 200:
             data = response.json()
-            if data and 'servers' in data and data['servers'] and data["isCustom"] == False:
+            if data and 'servers' in data and data['servers']:
                 return True
         return False
 
@@ -99,5 +101,34 @@ class NFManager:
         if response.status_code == 200:
             data = response.json()
             if data and 'servers' in data and data['servers']:
-                return data['servers'][0]
-        return None
+                # 初始化最小编辑距离和对应的服务器
+                min_distance = float('inf')
+                best_match = None
+                best_match_with_tag = None
+
+                # 提取 name 中的 #3 类似的内容
+                name_tag_match = re.search(r'#\d+', name)
+                name_tag = name_tag_match.group(0) if name_tag_match else None
+
+                for server in data['servers']:
+                    prefix = server.get('prefix', '')
+                    # 提取 prefix 中 [] 包裹的内容
+                    match = re.search(r'\[(.*?)\]', prefix)
+                    if match:
+                        prefix_content = match.group(1).lower()  # 转换为小写
+                        # 计算编辑距离（忽略大小写）
+                        distance = Levenshtein.distance(name.lower(), prefix_content)
+                        if distance < min_distance:
+                            min_distance = distance
+                            best_match = server
+                            if name_tag and name_tag in prefix:
+                                best_match_with_tag = server
+                        elif distance == min_distance:
+                            if name_tag and name_tag in prefix:
+                                best_match_with_tag = server
+
+                # 如果有基于标签的最佳匹配，则返回该匹配
+                if best_match_with_tag:
+                    return best_match_with_tag
+                # 否则返回基于编辑距离的最佳匹配
+                return best_match
