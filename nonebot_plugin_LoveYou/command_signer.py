@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod, ABCMeta
 from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, PrivateMessageEvent
 from nonebot import logger
 
+
 class SingletonABCMeta(ABCMeta):
     _instances = {}
     _lock: threading.Lock = threading.Lock()
@@ -63,10 +64,10 @@ class BasicHandler(ABC, metaclass=SingletonABCMeta):
     def is_PrivateMessageEvent(event: Union[GroupMessageEvent, PrivateMessageEvent]):
         return event.message_type == 'private'
 
-    async def should_handle(self) -> bool:
+    async def should_handle(self, ** kwargs: Any) -> bool:
         return True
 
-    async def should_block(self) -> bool:
+    async def should_block(self, ** kwargs: Any) -> bool:
         return self.block
 
     def get_self_id(self) -> int:
@@ -115,9 +116,6 @@ class HandlerManager:
                 del cls._id_to_handler[handler_id]
                 return True
             return False
-        
-
-
 
 
 if __name__ == '__main__':
